@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CRM по MCP — агент и сервер</title>
+<style>
+  :root {
+    /* Не тёмная и не белая: приглушённый шалфейно-оливковый день. Светлота
+       основных площадей 56–65 %, текст почти чёрный — контраст выше 5:1.
+       Половины экрана отличаются фоном, между ними — явный разделитель. */
+    --bg-left: #9ca888; --bg-right: #94a07f; --panel: #a8b28d; --panel-soft: #a0ac86;
+    --field: #aeb891; --line: #808d6b; --divider: #36402f;
+    --text: #101508; --muted: #1b2413; --accent: #17351c; --accent-dark: #0e2713;
+    --ok: #17351c; --warn: #4a3306; --bad: #611a15;
+    --user: #94a97a; --user-line: #7a8f61; --shadow: 0 1px 3px rgba(25,35,15,.18);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg-left); color: var(--text);
+    font: 20.5px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .app { height: 100%; display: grid; grid-template-columns: 1fr 1fr; }
+  .pane { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+  .pane.left { background: var(--bg-left); }
+  .pane.right {
+    background: var(--bg-right); border-left: 3px solid var(--divider);
+    box-shadow: inset 12px 0 20px -16px rgba(30,45,20,.55);
+  }
+
+  header.pane-head { padding: 18px 22px 14px; border-bottom: 1px solid var(--line); background: var(--panel-soft); }
+  header.pane-head h1 { margin: 0; font-size: 27.5px; font-weight: 680; letter-spacing: .01em; }
+  header.pane-head .sub { margin-top: 4px; color: var(--muted); font-size: 18.5px; }
+
+  button {
+    font: inherit; font-size: 19px; cursor: pointer; border-radius: 10px; padding: 10px 17px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--text); transition: .12s;
+    box-shadow: var(--shadow);
+  }
+  button:hover:not(:disabled) { border-color: var(--divider); background: var(--panel-soft); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: var(--accent-dark); border-color: var(--accent-dark); }
+  button:disabled { opacity: .4; cursor: default; }
+  input, textarea, select {
+    font: inherit; background: var(--field); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px;
+  }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
+  ::placeholder { color: var(--muted); opacity: .85; }
+
+  /* ---------- левая половина: агент ---------- */
+  .conn { padding: 16px 22px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .conn-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--bad); flex: none; box-shadow: 0 0 0 4px rgba(116,38,32,.25); }
+  .dot.on { background: var(--ok); box-shadow: 0 0 0 4px rgba(36,70,42,.28); }
+  .conn-text { flex: 1; min-width: 260px; }
+  .conn-title { font-size: 23px; font-weight: 640; }
+  .conn-sub { color: var(--muted); font-size: 18.5px; margin-top: 3px; }
+  .conn-buttons { display: flex; gap: 8px; }
+
+  .tools-block { margin-top: 16px; }
+  .label { color: var(--muted); font-size: 15.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .chip {
+    background: var(--field); border: 1px solid var(--line); border-radius: 999px;
+    padding: 7px 14px; font-size: 18px; font-family: ui-monospace, Consolas, monospace;
+  }
+  .chip.empty { font-family: inherit; color: var(--muted); }
+
+  .chat { flex: 1; overflow-y: auto; padding: 22px; display: flex; flex-direction: column; gap: 16px; }
+  .msg { max-width: 92%; display: flex; flex-direction: column; gap: 6px; }
+  .msg.user { align-self: flex-end; align-items: flex-end; }
+  .bubble { padding: 12px 16px; border-radius: 14px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user .bubble { background: var(--user); border: 1px solid var(--user-line); border-bottom-right-radius: 4px; }
+  .msg.bot .bubble { background: var(--panel); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
+  .msg .meta { color: var(--muted); font-size: 17.5px; display: flex; gap: 10px; flex-wrap: wrap; }
+  .meta .used { color: var(--ok); font-family: ui-monospace, Consolas, monospace; }
+  .meta .used.bad { color: var(--bad); }
+  .empty-chat { color: var(--muted); font-size: 20px; margin: auto; text-align: center; max-width: 540px; }
+
+  .examples { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 22px 12px; }
+  .example {
+    background: transparent; border: 1px dashed var(--line); color: var(--muted);
+    border-radius: 999px; padding: 7px 14px; font-size: 18px;
+  }
+  .example:hover { color: var(--text); border-style: solid; }
+
+  .composer { display: flex; gap: 10px; padding: 0 22px 16px; align-items: flex-end; }
+  .composer textarea { flex: 1; resize: none; min-height: 62px; max-height: 180px; }
+  .composer button { height: 62px; }
+
+  details.log { border-top: 2px solid var(--line); background: var(--panel); max-height: 45%; display: flex; flex-direction: column; }
+  details.log > summary {
+    padding: 13px 22px; cursor: pointer; color: var(--muted); font-size: 17px; font-weight: 600;
+    letter-spacing: .09em; text-transform: uppercase; list-style: none; user-select: none; flex: none;
+  }
+  details.log > summary::-webkit-details-marker { display: none; }
+  details.log > summary::before { content: '▸  '; }
+  details.log[open] > summary::before { content: '▾  '; }
+  .log-body { overflow-y: auto; padding: 0 22px 16px; }
+  .log-line { border-top: 1px solid var(--line); padding: 8px 0; }
+  .log-head { display: flex; gap: 12px; align-items: baseline; cursor: pointer; font-size: 18px; }
+  .log-time { color: var(--muted); font-family: ui-monospace, Consolas, monospace; font-size: 17px; }
+  .log-method { font-family: ui-monospace, Consolas, monospace; color: var(--accent); min-width: 132px; }
+  .log-line.bad .log-method { color: var(--bad); }
+  .log-sum { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log-detail {
+    display: none; margin: 8px 0 4px; padding: 12px; background: var(--field); border: 1px solid var(--line);
+    border-radius: 8px; max-height: 260px; overflow: auto; white-space: pre;
+    font: 17px/1.55 ui-monospace, Consolas, monospace; color: var(--accent);
+  }
+  .log-line.open .log-detail { display: block; }
+
+  /* ---------- правая половина: CRM ---------- */
+  .right-body { flex: 1; overflow-y: auto; padding: 18px 22px 24px; display: flex; flex-direction: column; gap: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px;
+          box-shadow: var(--shadow); }
+  .card-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+  .card-title { font-size: 23px; font-weight: 680; }
+  .card-sub { color: var(--muted); font-size: 18.5px; margin-top: 4px; }
+  .card-sub code { font-family: ui-monospace, Consolas, monospace; font-size: 17.5px; }
+  .pill { font-size: 17.5px; color: var(--muted); font-weight: 500; margin-left: 8px; }
+
+  .switch { display: inline-flex; align-items: center; gap: 10px; }
+  .switch button {
+    width: 108px; font-weight: 700; letter-spacing: .04em;
+    background: #93ab7d; border-color: var(--accent); color: var(--accent-dark);
+  }
+  .switch button.off { background: #b08a80; border-color: var(--bad); color: #3a100c; }
+
+  .tool-row { display: flex; gap: 12px; align-items: flex-start; padding: 11px 0; border-top: 1px solid var(--line); }
+  .tool-row:first-of-type { border-top: none; }
+  .tool-row input { width: 23px; height: 23px; margin-top: 3px; accent-color: var(--accent); flex: none; }
+  .tool-name { font-family: ui-monospace, Consolas, monospace; font-size: 20px; }
+  .tool-row.off .tool-name { color: var(--muted); text-decoration: line-through; }
+  .tool-desc { color: var(--muted); font-size: 18px; margin-top: 3px; line-height: 1.45; }
+
+  table.clients { width: 100%; border-collapse: collapse; margin-top: 6px; }
+  table.clients th {
+    text-align: left; color: var(--muted); font-size: 15.5px; letter-spacing: .07em;
+    text-transform: uppercase; font-weight: 500; padding: 6px 8px 6px 0;
+  }
+  table.clients td { padding: 9px 8px 9px 0; border-top: 1px solid var(--line); vertical-align: middle; }
+  table.clients td.num { color: var(--muted); font-family: ui-monospace, Consolas, monospace; width: 40px; }
+  table.clients td.name { font-size: 20.5px; }
+  table.clients td.amount { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  table.clients select { padding: 6px 9px; font-size: 18px; }
+  .note { color: var(--muted); font-size: 17.5px; margin-top: 3px; }
+  .flash { animation: flash 1.4s ease-out; }
+  @keyframes flash { from { background: rgba(255,255,255,.45); } to { background: transparent; } }
+
+  .row-form { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+  .row-form input.cname { flex: 1; min-width: 150px; }
+  .row-form input.camount { width: 165px; }
+
+  .warn-line { color: var(--warn); font-size: 18.5px; font-weight: 500; margin-top: 10px; }
+  .error-line { color: var(--bad); font-size: 18.5px; font-weight: 500; margin-top: 10px; }
+
+  @media (max-width: 1040px) {
+    .app { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+    .pane.right { border-left: none; border-top: 3px solid var(--divider); box-shadow: none; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ========== слева: агент и его соединение с MCP ========== -->
+  <section class="pane left">
+    <header class="pane-head">
+      <h1>Агент отдела продаж</h1>
+      <div class="sub">чат с моделью <span id="model">—</span> · инструменты берёт с MCP-сервера</div>
+    </header>
+
+    <div class="conn">
+      <div class="conn-row">
+        <span class="dot" id="dot"></span>
+        <div class="conn-text">
+          <div class="conn-title" id="conn-title">Нет соединения</div>
+          <div class="conn-sub" id="conn-sub">нажмите «Подключиться»</div>
+        </div>
+        <div class="conn-buttons">
+          <button class="primary" id="btn-connect">Подключиться</button>
+          <button id="btn-refresh" title="Запросить tools/list заново">Обновить список</button>
+        </div>
+      </div>
+      <div class="tools-block">
+        <div class="label">Инструменты, полученные от сервера <span id="tools-count"></span></div>
+        <div class="chips" id="agent-tools"></div>
+      </div>
+      <div class="error-line" id="conn-error" hidden></div>
+    </div>
+
+    <div class="chat" id="chat"></div>
+    <div class="examples" id="examples"></div>
+    <div class="composer">
+      <textarea id="input" rows="2" placeholder="Например: какие клиенты в работе?"></textarea>
+      <button class="primary" id="send">Отправить</button>
+    </div>
+
+    <details class="log" id="logbox">
+      <summary>Обмен по MCP <span id="log-count"></span></summary>
+      <div class="log-body" id="log"></div>
+    </details>
+  </section>
+
+  <!-- ========== справа: сам MCP-сервер, он же CRM ========== -->
+  <section class="pane right">
+    <header class="pane-head">
+      <h1>CRM «Клиенты» — это и есть MCP-сервер</h1>
+      <div class="sub">здесь работает человек; агент видит то же самое, но через инструменты</div>
+    </header>
+
+    <div class="right-body">
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <div class="card-title">MCP-сервер</div>
+            <div class="card-sub">адрес для клиентов: <code id="mcp-url">—</code></div>
+          </div>
+          <div class="switch"><button id="server-toggle">ВКЛ</button></div>
+        </div>
+        <div class="warn-line" id="server-off-note" hidden>Сервер выключен: соединение агента закрыто, новые подключения получают 503.</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Инструменты для агента<span class="pill" id="tools-pill"></span></div>
+        <div class="card-sub">то, что сервер отдаёт в ответе <code>tools/list</code>. Снимите галочку — инструмент пропадёт и у агента.</div>
+        <div id="tool-list" style="margin-top:10px"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Данные CRM</div>
+        <div class="card-sub">меняйте их руками — агент увидит правку при следующем вызове инструмента</div>
+        <table class="clients">
+          <thead>
+            <tr><th>№</th><th>Клиент</th><th>Статус</th><th style="text-align:right">Сумма</th></tr>
+          </thead>
+          <tbody id="clients"></tbody>
+        </table>
+        <div class="row-form">
+          <input class="cname" id="new-name" placeholder="Название клиента" />
+          <input class="camount" id="new-amount" type="number" placeholder="Сумма, ₽" />
+          <button id="add-client">+ Клиент</button>
+          <button id="reset-crm">Сбросить данные</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+const EXAMPLES = [
+  'Какие клиенты у нас в работе?',
+  'Покажи сводку по CRM',
+  'Заведи клиента «ООО Заря» на 90 000 и переведи Соколова в работу',
+];
+
+let revision = -1;       // номер состояния: перерисовываем только при изменении
+let pending = false;     // ждём ответ агента
+let lastError = '';      // ошибка последнего действия
+const openLogs = new Set();  // раскрытые строки журнала переживают перерисовку
+const seenClients = new Set();  // чтобы подсветить появившиеся строки
+
+const $ = (id) => document.getElementById(id);
+
+async function post(path, body) {
+  const res = await fetch(path, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body || {}),
+  });
+  const data = await res.json();
+  lastError = data.ok === false ? (data.error || 'неизвестная ошибка') : '';
+  await refresh(true);
+  return data;
+}
+
+async function refresh(force) {
+  const state = await (await fetch('/api/state')).json();
+  if (!force && state.revision === revision) return;
+  revision = state.revision;
+  render(state);
+}
+
+function render(state) {
+  const mcp = state.agent.mcp;
+  const crm = state.crm;
+
+  $('model').textContent = state.agent.model;
+  $('mcp-url').textContent = mcp.url;
+
+  // --- состояние соединения
+  const connected = mcp.connected;
+  $('dot').className = 'dot' + (connected ? ' on' : '');
+  $('conn-title').textContent = connected ? 'Соединение с MCP установлено' : 'Нет соединения';
+  $('conn-sub').textContent = connected
+    ? `сервер «${mcp.info.server}» · версия ${mcp.info.version} · протокол ${mcp.info.protocol}`
+    : (crm.server_on ? 'нажмите «Подключиться»' : 'сервер выключен в правой панели');
+  const btn = $('btn-connect');
+  btn.textContent = connected ? 'Отключиться' : 'Подключиться';
+  btn.className = connected ? '' : 'primary';
+  btn.onclick = () => post(connected ? '/api/mcp/disconnect' : '/api/mcp/connect');
+  $('btn-refresh').disabled = !connected;
+
+  const problem = lastError || (!connected && mcp.error ? mcp.error : '');
+  $('conn-error').hidden = !problem;
+  $('conn-error').textContent = problem;
+
+  // --- инструменты, которые агент получил от сервера
+  $('tools-count').textContent = connected ? `(${mcp.tools.length})` : '';
+  const chips = $('agent-tools');
+  chips.innerHTML = '';
+  if (!mcp.tools.length) {
+    chips.innerHTML = '<span class="chip empty">пока ничего: список приходит после подключения</span>';
+  } else {
+    for (const t of mcp.tools) {
+      const el = document.createElement('span');
+      el.className = 'chip';
+      el.textContent = t.name;
+      el.title = t.description;
+      chips.appendChild(el);
+    }
+  }
+
+  renderChat(state.agent.messages);
+  renderLog(mcp.log);
+
+  // --- правая панель: выключатель сервера
+  const power = $('server-toggle');
+  power.textContent = crm.server_on ? 'ВКЛ' : 'ВЫКЛ';
+  power.className = crm.server_on ? '' : 'off';
+  power.onclick = () => post('/api/server', {on: !crm.server_on});
+  $('server-off-note').hidden = crm.server_on;
+
+  // --- правая панель: инструменты сервера
+  const on = crm.tools.filter((t) => t.on).length;
+  $('tools-pill').textContent = `включено ${on} из ${crm.tools.length}`;
+  const list = $('tool-list');
+  list.innerHTML = '';
+  for (const tool of crm.tools) {
+    const row = document.createElement('label');
+    row.className = 'tool-row' + (tool.on ? '' : ' off');
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = tool.on;
+    box.onchange = () => post('/api/tool', {name: tool.name, on: box.checked});
+    const text = document.createElement('div');
+    text.innerHTML = `<div class="tool-name">${tool.name}</div><div class="tool-desc"></div>`;
+    text.querySelector('.tool-desc').textContent = tool.description;
+    row.append(box, text);
+    list.appendChild(row);
+  }
+
+  // --- правая панель: данные CRM
+  const tbody = $('clients');
+  tbody.innerHTML = '';
+  for (const client of crm.clients) {
+    const tr = document.createElement('tr');
+    if (!seenClients.has(client.id)) {
+      seenClients.add(client.id);
+      if (revision > 2) tr.className = 'flash';
+    }
+    const num = document.createElement('td');
+    num.className = 'num';
+    num.textContent = client.id;
+
+    const name = document.createElement('td');
+    name.className = 'name';
+    name.textContent = client.name;
+    if (client.note) {
+      const note = document.createElement('div');
+      note.className = 'note';
+      note.textContent = client.note;
+      name.appendChild(note);
+    }
+
+    const status = document.createElement('td');
+    const select = document.createElement('select');
+    for (const value of crm.statuses) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = value;
+      option.selected = value === client.status;
+      select.appendChild(option);
+    }
+    select.onchange = () => post('/api/crm/status', {client_id: client.id, status: select.value});
+    status.appendChild(select);
+
+    const amount = document.createElement('td');
+    amount.className = 'amount';
+    amount.textContent = client.amount.toLocaleString('ru-RU') + ' ₽';
+
+    tr.append(num, name, status, amount);
+    tbody.appendChild(tr);
+  }
+}
+
+// Модель отвечает лёгкой разметкой: жирное показываем жирным, остальное — как есть.
+function markup(text) {
+  const safe = text.replace(/[&<>]/g, (ch) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[ch]));
+  return safe.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+}
+
+function renderChat(messages) {
+  const chat = $('chat');
+  const atBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 60;
+  chat.innerHTML = '';
+
+  if (!messages.length && !pending) {
+    const hint = document.createElement('div');
+    hint.className = 'empty-chat';
+    hint.textContent = 'Подключитесь к MCP-серверу и спросите про клиентов. Агент ответит только тем, что достанет инструментами.';
+    chat.appendChild(hint);
+  }
+
+  for (const m of messages) {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg ' + (m.role === 'user' ? 'user' : 'bot');
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.innerHTML = markup(m.text);
+    wrap.appendChild(bubble);
+
+    if (m.role === 'assistant') {
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      for (const call of m.calls || []) {
+        const tag = document.createElement('span');
+        tag.className = 'used' + (call.ok ? '' : ' bad');
+        tag.textContent = (call.ok ? '⚙ ' : '✕ ') + call.name;
+        tag.title = JSON.stringify(call.arguments);
+        meta.appendChild(tag);
+      }
+      const cost = document.createElement('span');
+      cost.textContent = `${m.tokens} токенов · ${m.seconds} с`;
+      meta.appendChild(cost);
+      wrap.appendChild(meta);
+    }
+    chat.appendChild(wrap);
+  }
+
+  if (pending) {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg bot';
+    wrap.innerHTML = '<div class="bubble">Агент думает…</div>';
+    chat.appendChild(wrap);
+  }
+  if (atBottom || pending) chat.scrollTop = chat.scrollHeight;
+}
+
+function renderLog(log) {
+  $('log-count').textContent = log.length ? `(${log.length})` : '';
+  const box = $('log');
+  box.innerHTML = '';
+  log.forEach((entry, index) => {
+    const key = entry.time + entry.method + index;
+    const line = document.createElement('div');
+    line.className = 'log-line' + (entry.ok ? '' : ' bad') + (openLogs.has(key) ? ' open' : '');
+    const head = document.createElement('div');
+    head.className = 'log-head';
+    head.innerHTML = '<span class="log-time"></span><span class="log-method"></span><span class="log-sum"></span>';
+    head.querySelector('.log-time').textContent = entry.time;
+    head.querySelector('.log-method').textContent = entry.method;
+    head.querySelector('.log-sum').textContent = entry.summary;
+    head.onclick = () => {
+      line.classList.toggle('open');
+      if (line.classList.contains('open')) openLogs.add(key); else openLogs.delete(key);
+    };
+    const detail = document.createElement('pre');
+    detail.className = 'log-detail';
+    detail.textContent = entry.detail || 'без подробностей';
+    line.append(head, detail);
+    box.appendChild(line);
+  });
+  box.scrollTop = box.scrollHeight;
+}
+
+async function send() {
+  const input = $('input');
+  const text = input.value.trim();
+  if (!text || pending) return;
+  input.value = '';
+  pending = true;
+  $('send').disabled = true;
+  await refresh(true);
+  try {
+    await post('/api/chat', {text});
+  } finally {
+    pending = false;
+    $('send').disabled = false;
+    await refresh(true);
+  }
+}
+
+$('send').onclick = send;
+$('input').onkeydown = (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+};
+$('btn-refresh').onclick = () => post('/api/mcp/refresh');
+$('add-client').onclick = () => {
+  const name = $('new-name').value.trim();
+  if (!name) return;
+  const amount = parseInt($('new-amount').value || '0', 10) || 0;
+  $('new-name').value = '';
+  $('new-amount').value = '';
+  post('/api/crm/client', {name, amount});
+};
+$('reset-crm').onclick = () => post('/api/crm/reset');
+
+for (const text of EXAMPLES) {
+  const chip = document.createElement('button');
+  chip.className = 'example';
+  chip.textContent = text;
+  chip.onclick = () => { $('input').value = text; $('input').focus(); };
+  $('examples').appendChild(chip);
+}
+
+refresh(true);
+setInterval(() => refresh(false), 1200);
+</script>
+</body>
+</html>
