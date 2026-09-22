@@ -1,12 +1,14 @@
 """Одно приложение — два сервиса на одном порту.
 
-  * MCP-сервер CRM   — смонтирован на /mcp (транспорт streamable HTTP);
-  * чат с агентом    — интерфейс на / и небольшой HTTP-API на /api.
+  * MCP-сервер GitHub — смонтирован на /mcp (транспорт streamable HTTP);
+  * чат с агентом     — интерфейс на / и небольшой HTTP-API на /api.
 
-Агент ходит в MCP-сервер по сети, как ходил бы любой внешний клиент.
+Агент ходит в MCP-сервер по сети, как ходил бы любой внешний клиент, а сервер
+за каждым ответом ходит в api.github.com.
 
 Запуск: python -m app.main  →  http://127.0.0.1:8000
 """
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,7 +19,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from . import agent, config
-from . import mcp_server as crm
+from . import github_api as gh
+from . import mcp_server as srv
 from .mcp_server import mcp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(name)s  %(message)s", datefmt="%H:%M:%S")
@@ -46,12 +49,18 @@ async def lifespan(app: FastAPI):
     # У смонтированного приложения свой lifespan не запускается, поэтому
     # менеджер сессий MCP поднимаем здесь — без него /mcp отвечает ошибкой.
     async with mcp.session_manager.run():
-        logger.info("MCP-сервер CRM слушает на %s", config.MCP_URL)
+        logger.info("MCP-сервер GitHub слушает на %s", config.MCP_URL)
+        logger.info("Репозиторий под сервером: %s", config.GITHUB_REPO)
+        # Сводку для правой панели тянем фоном: старт приложения не должен
+        # ждать, пока ответит GitHub.
+        warmup = asyncio.create_task(srv.refresh_overview())
         yield
+        warmup.cancel()
         await agent.link.disconnect("остановка приложения")
+        await gh.close()
 
 
-app = FastAPI(title="MCP CRM + агент", lifespan=lifespan)
+app = FastAPI(title="MCP GitHub + агент", lifespan=lifespan)
 app.mount(config.MCP_PATH, mcp_app)
 
 
@@ -63,10 +72,10 @@ async def mcp_power_switch(request, call_next):
     словами, а не «внутренней ошибкой сервера».
     """
     if request.url.path.startswith(config.MCP_PATH):
-        if not crm.server_on:
+        if not srv.server_on:
             return JSONResponse(
                 {"jsonrpc": "2.0", "id": 0,
-                 "error": {"code": -32000, "message": "MCP-сервер выключен в панели CRM"}},
+                 "error": {"code": -32000, "message": "MCP-сервер выключен в правой панели"}},
                 status_code=503,
             )
         # Человек, открывший этот адрес в браузере, получил бы «Missing session
@@ -85,8 +94,8 @@ def index() -> FileResponse:
 
 @app.get("/api/state")
 def state() -> dict:
-    return {"agent": agent.snapshot(), "crm": crm.snapshot(),
-            "revision": agent.revision + crm.revision}
+    return {"agent": agent.snapshot(), "server": srv.snapshot(),
+            "revision": agent.revision + srv.revision}
 
 
 def _done(error: str | None = None) -> dict:
@@ -143,7 +152,7 @@ def chat_clear() -> dict:
     return _done()
 
 
-# --- правая половина: CRM и выключатели -------------------------------------
+# --- правая половина: сервер, его инструменты и сам репозиторий -------------
 
 class Switch(BaseModel):
     on: bool
@@ -154,29 +163,19 @@ class ToolSwitch(BaseModel):
     on: bool
 
 
-class NewClient(BaseModel):
-    name: str
-    amount: int = 0
-
-
-class StatusChange(BaseModel):
-    client_id: int
-    status: str
-
-
 @app.post("/api/server")
 async def server_switch(req: Switch) -> dict:
     # Соединение закрываем до выключения: иначе прощальный запрос клиента
     # упрётся в 503 и сессия останется висеть на сервере.
     if not req.on and agent.link.connected:
         await agent.link.disconnect("MCP-сервер выключен")
-    crm.set_server(req.on)
+    srv.set_server(req.on)
     return _done()
 
 
 @app.post("/api/tool")
 async def tool_switch(req: ToolSwitch) -> dict:
-    crm.set_tool(req.name, req.on)
+    srv.set_tool(req.name, req.on)
     # Набор инструментов на сервере изменился — подключённый агент тут же
     # перезапрашивает tools/list и показывает новый список.
     if agent.link.connected:
@@ -187,22 +186,10 @@ async def tool_switch(req: ToolSwitch) -> dict:
     return _done()
 
 
-@app.post("/api/crm/client")
-def crm_add(req: NewClient) -> dict:
-    crm.add_client(req.name, req.amount)
-    return _done()
-
-
-@app.post("/api/crm/status")
-def crm_status(req: StatusChange) -> dict:
-    result = crm.change_status(req.client_id, req.status)
-    return _done(result.get("ошибка"))
-
-
-@app.post("/api/crm/reset")
-def crm_reset() -> dict:
-    crm.reset()
-    return _done()
+@app.post("/api/repo/refresh")
+async def repo_refresh() -> dict:
+    """Перечитать репозиторий для правой панели (тот же GitHub, но для глаз)."""
+    return _done(await srv.refresh_overview())
 
 
 if __name__ == "__main__":

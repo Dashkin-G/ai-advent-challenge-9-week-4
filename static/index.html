@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>CRM по MCP — агент и сервер</title>
+<title>GitHub по MCP — агент и сервер</title>
 <style>
   :root {
     /* Не тёмная и не белая: приглушённый шалфейно-оливковый день. Светлота
@@ -48,6 +48,7 @@
   }
   input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
   ::placeholder { color: var(--muted); opacity: .85; }
+  a { color: var(--accent); text-underline-offset: 3px; }
 
   /* ---------- левая половина: агент ---------- */
   .conn { padding: 16px 22px; border-bottom: 1px solid var(--line); background: var(--panel); }
@@ -112,7 +113,7 @@
   }
   .log-line.open .log-detail { display: block; }
 
-  /* ---------- правая половина: CRM ---------- */
+  /* ---------- правая половина: репозиторий на GitHub ---------- */
   .right-body { flex: 1; overflow-y: auto; padding: 18px 22px 24px; display: flex; flex-direction: column; gap: 16px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px;
           box-shadow: var(--shadow); }
@@ -135,24 +136,29 @@
   .tool-name { font-family: ui-monospace, Consolas, monospace; font-size: 20px; }
   .tool-row.off .tool-name { color: var(--muted); text-decoration: line-through; }
   .tool-desc { color: var(--muted); font-size: 18px; margin-top: 3px; line-height: 1.45; }
-
-  table.clients { width: 100%; border-collapse: collapse; margin-top: 6px; }
-  table.clients th {
-    text-align: left; color: var(--muted); font-size: 15.5px; letter-spacing: .07em;
-    text-transform: uppercase; font-weight: 500; padding: 6px 8px 6px 0;
+  .tool-params { margin-top: 5px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .param {
+    font-family: ui-monospace, Consolas, monospace; font-size: 16.5px;
+    border: 1px solid var(--line); border-radius: 6px; padding: 1px 7px; color: var(--accent);
   }
-  table.clients td { padding: 9px 8px 9px 0; border-top: 1px solid var(--line); vertical-align: middle; }
-  table.clients td.num { color: var(--muted); font-family: ui-monospace, Consolas, monospace; width: 40px; }
-  table.clients td.name { font-size: 20.5px; }
-  table.clients td.amount { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
-  table.clients select { padding: 6px 9px; font-size: 18px; }
-  .note { color: var(--muted); font-size: 17.5px; margin-top: 3px; }
+  .param.optional { color: var(--muted); border-style: dashed; }
+
+  .repo-name { font-size: 22px; font-family: ui-monospace, Consolas, monospace; }
+  .repo-desc { color: var(--muted); font-size: 18.5px; margin-top: 4px; }
+  .meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 18px; margin-top: 14px; }
+  .meta-cell .meta-key { color: var(--muted); font-size: 15.5px; letter-spacing: .07em; text-transform: uppercase; }
+  .meta-cell .meta-val { font-size: 19.5px; margin-top: 2px; font-variant-numeric: tabular-nums; }
+
+  .rows { margin-top: 8px; }
+  .row-item { padding: 10px 0; border-top: 1px solid var(--line); }
+  .row-item:first-child { border-top: none; }
+  .row-title { display: flex; gap: 10px; align-items: baseline; }
+  .sha, .num-tag { font-family: ui-monospace, Consolas, monospace; font-size: 18px; color: var(--accent); flex: none; }
+  .row-text { font-size: 19.5px; overflow: hidden; text-overflow: ellipsis; }
+  .row-sub { color: var(--muted); font-size: 17.5px; margin-top: 2px; }
+  .empty-row { color: var(--muted); font-size: 18.5px; padding: 8px 0; }
   .flash { animation: flash 1.4s ease-out; }
   @keyframes flash { from { background: rgba(255,255,255,.45); } to { background: transparent; } }
-
-  .row-form { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
-  .row-form input.cname { flex: 1; min-width: 150px; }
-  .row-form input.camount { width: 165px; }
 
   .warn-line { color: var(--warn); font-size: 18.5px; font-weight: 500; margin-top: 10px; }
   .error-line { color: var(--bad); font-size: 18.5px; font-weight: 500; margin-top: 10px; }
@@ -169,7 +175,7 @@
   <!-- ========== слева: агент и его соединение с MCP ========== -->
   <section class="pane left">
     <header class="pane-head">
-      <h1>Агент отдела продаж</h1>
+      <h1>Агент по репозиторию</h1>
       <div class="sub">чат с моделью <span id="model">—</span> · инструменты берёт с MCP-сервера</div>
     </header>
 
@@ -195,7 +201,7 @@
     <div class="chat" id="chat"></div>
     <div class="examples" id="examples"></div>
     <div class="composer">
-      <textarea id="input" rows="2" placeholder="Например: какие клиенты в работе?"></textarea>
+      <textarea id="input" rows="2" placeholder="Например: что изменилось в последнем коммите?"></textarea>
       <button class="primary" id="send">Отправить</button>
     </div>
 
@@ -205,11 +211,11 @@
     </details>
   </section>
 
-  <!-- ========== справа: сам MCP-сервер, он же CRM ========== -->
+  <!-- ========== справа: сам MCP-сервер, он же обёртка вокруг GitHub ========== -->
   <section class="pane right">
     <header class="pane-head">
-      <h1>CRM «Клиенты» — это и есть MCP-сервер</h1>
-      <div class="sub">здесь работает человек; агент видит то же самое, но через инструменты</div>
+      <h1>Репозиторий на GitHub — вокруг него MCP-сервер</h1>
+      <div class="sub">здесь то же самое видит человек; агент — через инструменты, по протоколу</div>
     </header>
 
     <div class="right-body">
@@ -221,30 +227,43 @@
           </div>
           <div class="switch"><button id="server-toggle">ВКЛ</button></div>
         </div>
+        <div class="card-sub" id="api-line">источник данных: —</div>
         <div class="warn-line" id="server-off-note" hidden>Сервер выключен: соединение агента закрыто, новые подключения получают 503.</div>
+        <div class="warn-line" id="anon-note" hidden>Токена нет: GitHub отвечает, но даёт 60 запросов в час. Свой ключ — в <code>GITHUB_TOKEN</code>.</div>
       </div>
 
       <div class="card">
         <div class="card-title">Инструменты для агента<span class="pill" id="tools-pill"></span></div>
-        <div class="card-sub">то, что сервер отдаёт в ответе <code>tools/list</code>. Снимите галочку — инструмент пропадёт и у агента.</div>
+        <div class="card-sub">то, что сервер отдаёт в ответе <code>tools/list</code>: имя, описание и входные параметры (пунктирные — необязательные). Снимите галочку — инструмент пропадёт и у агента.</div>
         <div id="tool-list" style="margin-top:10px"></div>
       </div>
 
       <div class="card">
-        <div class="card-title">Данные CRM</div>
-        <div class="card-sub">меняйте их руками — агент увидит правку при следующем вызове инструмента</div>
-        <table class="clients">
-          <thead>
-            <tr><th>№</th><th>Клиент</th><th>Статус</th><th style="text-align:right">Сумма</th></tr>
-          </thead>
-          <tbody id="clients"></tbody>
-        </table>
-        <div class="row-form">
-          <input class="cname" id="new-name" placeholder="Название клиента" />
-          <input class="camount" id="new-amount" type="number" placeholder="Сумма, ₽" />
-          <button id="add-client">+ Клиент</button>
-          <button id="reset-crm">Сбросить данные</button>
+        <div class="card-head">
+          <div>
+            <div class="card-title">Репозиторий</div>
+            <div class="card-sub" id="repo-updated">—</div>
+          </div>
+          <button id="repo-refresh">Обновить</button>
         </div>
+        <div style="margin-top:12px">
+          <div class="repo-name"><a id="repo-link" href="#" target="_blank" rel="noopener">—</a></div>
+          <div class="repo-desc" id="repo-desc"></div>
+          <div class="meta-grid" id="repo-meta"></div>
+        </div>
+        <div class="error-line" id="repo-error" hidden></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Последние коммиты</div>
+        <div class="card-sub">то же самое агент получает инструментом <code>list_commits</code></div>
+        <div class="rows" id="commits"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Открытые задачи</div>
+        <div class="card-sub">инструмент <code>list_issues</code>; GitHub считает задачами и pull request'ы</div>
+        <div class="rows" id="issues"></div>
       </div>
     </div>
   </section>
@@ -252,16 +271,17 @@
 
 <script>
 const EXAMPLES = [
-  'Какие клиенты у нас в работе?',
-  'Покажи сводку по CRM',
-  'Заведи клиента «ООО Заря» на 90 000 и переведи Соколова в работу',
+  'Что изменилось в последнем коммите?',
+  'Из каких файлов состоит проект?',
+  'Загляни в README и расскажи, что это за проект',
 ];
 
 let revision = -1;       // номер состояния: перерисовываем только при изменении
 let pending = false;     // ждём ответ агента
 let lastError = '';      // ошибка последнего действия
-const openLogs = new Set();  // раскрытые строки журнала переживают перерисовку
-const seenClients = new Set();  // чтобы подсветить появившиеся строки
+const openLogs = new Set();   // раскрытые строки журнала переживают перерисовку
+const seenCommits = new Set(); // чтобы подсветить приехавший коммит
+let painted = false;          // первая отрисовка ничего не подсвечивает
 
 const $ = (id) => document.getElementById(id);
 
@@ -285,7 +305,7 @@ async function refresh(force) {
 
 function render(state) {
   const mcp = state.agent.mcp;
-  const crm = state.crm;
+  const srv = state.server;
 
   $('model').textContent = state.agent.model;
   $('mcp-url').textContent = mcp.url;
@@ -296,7 +316,7 @@ function render(state) {
   $('conn-title').textContent = connected ? 'Соединение с MCP установлено' : 'Нет соединения';
   $('conn-sub').textContent = connected
     ? `сервер «${mcp.info.server}» · версия ${mcp.info.version} · протокол ${mcp.info.protocol}`
-    : (crm.server_on ? 'нажмите «Подключиться»' : 'сервер выключен в правой панели');
+    : (srv.server_on ? 'нажмите «Подключиться»' : 'сервер выключен в правой панели');
   const btn = $('btn-connect');
   btn.textContent = connected ? 'Отключиться' : 'Подключиться';
   btn.className = connected ? '' : 'primary';
@@ -325,74 +345,127 @@ function render(state) {
 
   renderChat(state.agent.messages);
   renderLog(mcp.log);
+  renderServer(srv);
+  painted = true;
+}
 
-  // --- правая панель: выключатель сервера
+function renderServer(srv) {
+  // --- выключатель сервера и то, откуда он берёт данные
   const power = $('server-toggle');
-  power.textContent = crm.server_on ? 'ВКЛ' : 'ВЫКЛ';
-  power.className = crm.server_on ? '' : 'off';
-  power.onclick = () => post('/api/server', {on: !crm.server_on});
-  $('server-off-note').hidden = crm.server_on;
+  power.textContent = srv.server_on ? 'ВКЛ' : 'ВЫКЛ';
+  power.className = srv.server_on ? '' : 'off';
+  power.onclick = () => post('/api/server', {on: !srv.server_on});
+  $('server-off-note').hidden = srv.server_on;
 
-  // --- правая панель: инструменты сервера
-  const on = crm.tools.filter((t) => t.on).length;
-  $('tools-pill').textContent = `включено ${on} из ${crm.tools.length}`;
+  const auth = srv.auth;
+  const left = auth.remaining === null
+    ? 'лимит пока не известен'
+    : `осталось ${auth.remaining} из ${auth.limit} запросов в час`;
+  $('api-line').textContent = `источник данных: ${srv.api} · токен ${auth.source} · ${left}`;
+  $('anon-note').hidden = auth.authorized;
+
+  // --- инструменты сервера с их входными параметрами
+  const on = srv.tools.filter((t) => t.on).length;
+  $('tools-pill').textContent = `включено ${on} из ${srv.tools.length}`;
   const list = $('tool-list');
   list.innerHTML = '';
-  for (const tool of crm.tools) {
+  for (const tool of srv.tools) {
     const row = document.createElement('label');
     row.className = 'tool-row' + (tool.on ? '' : ' off');
     const box = document.createElement('input');
     box.type = 'checkbox';
     box.checked = tool.on;
     box.onchange = () => post('/api/tool', {name: tool.name, on: box.checked});
+
     const text = document.createElement('div');
-    text.innerHTML = `<div class="tool-name">${tool.name}</div><div class="tool-desc"></div>`;
+    text.innerHTML = '<div class="tool-name"></div><div class="tool-desc"></div><div class="tool-params"></div>';
+    text.querySelector('.tool-name').textContent = tool.name;
     text.querySelector('.tool-desc').textContent = tool.description;
+    const params = text.querySelector('.tool-params');
+    for (const param of tool.params) {
+      const tag = document.createElement('span');
+      tag.className = 'param' + (param.required ? '' : ' optional');
+      tag.textContent = param.name;
+      tag.title = param.required ? 'обязательный параметр' : 'необязательный параметр';
+      params.appendChild(tag);
+    }
     row.append(box, text);
     list.appendChild(row);
   }
 
-  // --- правая панель: данные CRM
-  const tbody = $('clients');
-  tbody.innerHTML = '';
-  for (const client of crm.clients) {
-    const tr = document.createElement('tr');
-    if (!seenClients.has(client.id)) {
-      seenClients.add(client.id);
-      if (revision > 2) tr.className = 'flash';
+  // --- сама карточка репозитория
+  $('repo-refresh').disabled = srv.loading;
+  $('repo-updated').textContent = srv.loading
+    ? 'спрашиваем GitHub…'
+    : (srv.updated ? `данные получены в ${srv.updated}` : 'ещё не запрашивали');
+  $('repo-error').hidden = !srv.error;
+  $('repo-error').textContent = srv.error || '';
+
+  const repo = srv.overview;
+  const link = $('repo-link');
+  link.textContent = repo ? repo.repo : srv.repo;
+  link.href = repo ? repo.url : `https://github.com/${srv.repo}`;
+  $('repo-desc').textContent = repo ? repo.description : '';
+
+  const meta = $('repo-meta');
+  meta.innerHTML = '';
+  if (repo) {
+    const cells = [
+      ['ветка', repo.branch],
+      ['язык', repo.language],
+      ['звёзд', repo.stars],
+      ['форков', repo.forks],
+      ['открытых задач', repo.open_issues],
+      ['последняя запись', repo.pushed],
+    ];
+    for (const [key, value] of cells) {
+      const cell = document.createElement('div');
+      cell.className = 'meta-cell';
+      cell.innerHTML = '<div class="meta-key"></div><div class="meta-val"></div>';
+      cell.querySelector('.meta-key').textContent = key;
+      cell.querySelector('.meta-val').textContent = value;
+      meta.appendChild(cell);
     }
-    const num = document.createElement('td');
-    num.className = 'num';
-    num.textContent = client.id;
+  }
 
-    const name = document.createElement('td');
-    name.className = 'name';
-    name.textContent = client.name;
-    if (client.note) {
-      const note = document.createElement('div');
-      note.className = 'note';
-      note.textContent = client.note;
-      name.appendChild(note);
+  // --- последние коммиты: новый после «Обновить» подсвечивается
+  const commits = $('commits');
+  commits.innerHTML = '';
+  if (!repo || !repo.commits.length) {
+    commits.innerHTML = '<div class="empty-row">нет данных: нажмите «Обновить»</div>';
+  } else {
+    for (const commit of repo.commits) {
+      const item = document.createElement('div');
+      item.className = 'row-item';
+      if (!seenCommits.has(commit.sha)) {
+        seenCommits.add(commit.sha);
+        if (painted) item.classList.add('flash');
+      }
+      item.innerHTML = '<div class="row-title"><span class="sha"></span><span class="row-text"></span></div><div class="row-sub"></div>';
+      item.querySelector('.sha').textContent = commit.sha;
+      item.querySelector('.row-text').textContent = commit.message;
+      item.querySelector('.row-sub').textContent = `${commit.author} · ${commit.when}`;
+      commits.appendChild(item);
     }
+  }
 
-    const status = document.createElement('td');
-    const select = document.createElement('select');
-    for (const value of crm.statuses) {
-      const option = document.createElement('option');
-      option.value = value;
-      option.textContent = value;
-      option.selected = value === client.status;
-      select.appendChild(option);
+  // --- открытые задачи
+  const issues = $('issues');
+  issues.innerHTML = '';
+  if (!repo) {
+    issues.innerHTML = '<div class="empty-row">нет данных: нажмите «Обновить»</div>';
+  } else if (!repo.issues.length) {
+    issues.innerHTML = '<div class="empty-row">открытых задач нет — и это тоже ответ</div>';
+  } else {
+    for (const issue of repo.issues) {
+      const item = document.createElement('div');
+      item.className = 'row-item';
+      item.innerHTML = '<div class="row-title"><span class="num-tag"></span><span class="row-text"></span></div><div class="row-sub"></div>';
+      item.querySelector('.num-tag').textContent = '#' + issue.number;
+      item.querySelector('.row-text').textContent = issue.title;
+      item.querySelector('.row-sub').textContent = `${issue.kind} · ${issue.author}`;
+      issues.appendChild(item);
     }
-    select.onchange = () => post('/api/crm/status', {client_id: client.id, status: select.value});
-    status.appendChild(select);
-
-    const amount = document.createElement('td');
-    amount.className = 'amount';
-    amount.textContent = client.amount.toLocaleString('ru-RU') + ' ₽';
-
-    tr.append(num, name, status, amount);
-    tbody.appendChild(tr);
   }
 }
 
@@ -410,7 +483,7 @@ function renderChat(messages) {
   if (!messages.length && !pending) {
     const hint = document.createElement('div');
     hint.className = 'empty-chat';
-    hint.textContent = 'Подключитесь к MCP-серверу и спросите про клиентов. Агент ответит только тем, что достанет инструментами.';
+    hint.textContent = 'Подключитесь к MCP-серверу и спросите про репозиторий. Агент ответит только тем, что достанет инструментами из GitHub.';
     chat.appendChild(hint);
   }
 
@@ -498,15 +571,7 @@ $('input').onkeydown = (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 };
 $('btn-refresh').onclick = () => post('/api/mcp/refresh');
-$('add-client').onclick = () => {
-  const name = $('new-name').value.trim();
-  if (!name) return;
-  const amount = parseInt($('new-amount').value || '0', 10) || 0;
-  $('new-name').value = '';
-  $('new-amount').value = '';
-  post('/api/crm/client', {name, amount});
-};
-$('reset-crm').onclick = () => post('/api/crm/reset');
+$('repo-refresh').onclick = () => post('/api/repo/refresh');
 
 for (const text of EXAMPLES) {
   const chip = document.createElement('button');
