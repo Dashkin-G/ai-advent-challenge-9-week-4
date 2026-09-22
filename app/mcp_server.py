@@ -1,30 +1,47 @@
-"""MCP-сервер «CRM»: данные клиентов и инструменты поверх них.
+"""MCP-сервер вокруг GitHub REST API.
 
 Это первая половина проекта. Сервер поднимается внутри того же процесса, что и
 чат (см. `main.py`), но общается с агентом по протоколу MCP — транспорт
-streamable HTTP на `/mcp`. Данные живут в памяти процесса: перезапуск
-возвращает их к исходным, и это удобно для показа.
+streamable HTTP на `/mcp`. Данные он не придумывает и не хранит: каждый вызов
+инструмента — это живой запрос к api.github.com (см. `github_api.py`).
+
+Что здесь происходит по пунктам задания:
+
+* **регистрация инструмента** — `mcp.add_tool(...)` в цикле по `TOOL_SPECS`;
+* **описание входных параметров** — аннотации `Annotated[..., Field(...)]` у
+  функций: из них SDK сам собирает JSON-схему, которая уезжает агенту в ответе
+  `tools/list` и дальше модели;
+* **возврат результата** — функции отдают обычный словарь, SDK превращает его
+  в структурированный ответ `tools/call`.
 
 Сервер можно выключить целиком и можно выключить любой отдельный инструмент —
 тогда агент перестаёт его видеть в ответе `tools/list`.
 """
-from collections.abc import Callable
-from typing import Any
+import inspect
+from collections.abc import Awaitable, Callable
+from datetime import datetime
+from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import MCPServer
+from pydantic import Field
 
-STATUSES = ["новый", "в работе", "оплачен", "отказ"]
+from . import config
+from . import github_api as gh
 
-# Номер состояния: растёт на каждое изменение данных или настроек сервера.
-# По нему интерфейс понимает, что пора перерисовать правую панель.
+# Номер состояния: растёт на каждое изменение настроек сервера или панели.
+# По нему интерфейс понимает, что пора перерисовать правую половину.
 revision = 0
 
 # Выключатель всего сервера. Проверяется в `main.py` перед тем, как пустить
 # запрос на /mcp: выключенный сервер отвечает 503, и агент честно теряет связь.
 server_on = True
 
-clients: list[dict] = []
-_next_id = 1
+# Сводка по репозиторию для правой панели. Обновляется при старте и по кнопке:
+# панель не должна ходить в GitHub на каждый опрос состояния.
+overview: dict | None = None
+overview_error: str | None = None
+overview_time: str | None = None
+overview_loading = False
 
 
 def _touch() -> None:
@@ -32,121 +49,146 @@ def _touch() -> None:
     revision += 1
 
 
-def reset() -> None:
-    """Вернуть исходные данные CRM (кнопка «Сбросить» в панели оператора)."""
-    global clients, _next_id
-    clients = [
-        {"id": 1, "name": "ООО «Ромашка»", "status": "в работе", "amount": 120000,
-         "note": "поставка кофе в офис, ждут счёт"},
-        {"id": 2, "name": "ИП Соколов", "status": "новый", "amount": 45000,
-         "note": "пришёл с сайта, нужен звонок"},
-        {"id": 3, "name": "ООО «Вектор»", "status": "оплачен", "amount": 310000,
-         "note": "годовой договор, оплата прошла"},
-    ]
-    _next_id = 4
+async def refresh_overview() -> str | None:
+    """Перечитать репозиторий для правой панели. Возвращает текст ошибки или None."""
+    global overview, overview_error, overview_time, overview_loading
+    overview_loading = True
     _touch()
-
-
-reset()
-
-
-def find(client_id: int) -> dict | None:
-    return next((c for c in clients if c["id"] == client_id), None)
-
-
-def add_client(name: str, amount: int = 0, note: str = "") -> dict:
-    """Завести клиента. Общая точка для инструмента агента и кнопки оператора."""
-    global _next_id
-    client = {"id": _next_id, "name": name.strip() or f"Клиент {_next_id}",
-              "status": "новый", "amount": int(amount), "note": note}
-    clients.append(client)
-    _next_id += 1
-    _touch()
-    return client
-
-
-def change_status(client_id: int, status: str) -> dict:
-    """Сменить статус клиента. Тоже общая точка для агента и для оператора."""
-    client = find(client_id)
-    if client is None:
-        return {"ошибка": f"клиента №{client_id} нет в CRM"}
-    if status not in STATUSES:
-        return {"ошибка": f"статус «{status}» недопустим",
-                "допустимые": STATUSES}
-    was = client["status"]
-    client["status"] = status
-    _touch()
-    return {"клиент": client["name"], "было": was, "стало": status}
+    try:
+        overview = await gh.overview()
+        overview_error = None
+    except gh.GitHubError as e:
+        overview_error = str(e)
+    except Exception as e:  # сеть, прокси, неожиданный ответ — показываем как есть
+        overview_error = "{0}: {1}".format(type(e).__name__, e)
+    finally:
+        overview_loading = False
+        overview_time = datetime.now().strftime("%H:%M:%S")
+        _touch()
+    return overview_error
 
 
 # --- Инструменты, которые сервер отдаёт агенту -------------------------------
-# Возвращают простые словари: они уедут к модели как JSON, и русские ключи
-# читаются ею так же хорошо, как английские.
+# Каждый параметр описан прямо в аннотации: это описание уходит в JSON-схему,
+# а оттуда — модели, поэтому пишем так, будто объясняем человеку. Возвращаем
+# простые словари: они уедут к модели как JSON, и русские ключи читаются ею
+# так же хорошо, как английские.
 
-def tool_list_clients(status: str | None = None) -> dict:
-    rows = [c for c in clients if status is None or c["status"] == status]
-    return {"всего": len(rows), "клиенты": rows}
-
-
-def tool_get_client(client_id: int) -> dict:
-    client = find(client_id)
-    return client or {"ошибка": f"клиента №{client_id} нет в CRM"}
-
-
-def tool_create_client(name: str, amount: int = 0) -> dict:
-    return {"создан": add_client(name, amount)}
+RepoArg = Annotated[str | None, Field(
+    description="Репозиторий в виде «владелец/имя». Можно не указывать: "
+                "по умолчанию берётся репозиторий из настроек сервера.")]
+RefArg = Annotated[str | None, Field(
+    description="Ветка, тег или хеш коммита. По умолчанию — ветка репозитория "
+                "по умолчанию.")]
 
 
-def tool_set_status(client_id: int, status: str) -> dict:
-    return change_status(client_id, status)
+async def _guard(work: Awaitable[dict[str, Any]]) -> dict[str, Any]:
+    """Ошибку GitHub отдаём агенту словами, а не падением инструмента."""
+    try:
+        return await work
+    except gh.GitHubError as e:
+        return {"ошибка": str(e)}
 
 
-def tool_stats() -> dict:
-    by_status = {s: {"клиентов": 0, "сумма": 0} for s in STATUSES}
-    for c in clients:
-        row = by_status[c["status"]]
-        row["клиентов"] += 1
-        row["сумма"] += c["amount"]
-    return {"клиентов всего": len(clients),
-            "сумма всех сделок": sum(c["amount"] for c in clients),
-            "по статусам": by_status}
+async def tool_repo_info(repo: RepoArg = None) -> dict[str, Any]:
+    return await _guard(gh.repo_info(repo))
+
+
+async def tool_list_commits(
+    limit: Annotated[int, Field(
+        ge=1, le=30,
+        description="Сколько последних коммитов вернуть, от 1 до 30.")] = 5,
+    branch: Annotated[str | None, Field(
+        description="Ветка, из которой брать коммиты. По умолчанию — основная.")] = None,
+    path: Annotated[str | None, Field(
+        description="Путь к файлу или папке: тогда вернутся только коммиты, "
+                    "которые их трогали. Например app/agent.py.")] = None,
+    repo: RepoArg = None,
+) -> dict[str, Any]:
+    return await _guard(gh.list_commits(repo=repo, limit=limit, branch=branch, path=path))
+
+
+async def tool_commit_details(
+    sha: Annotated[str, Field(
+        description="Хеш коммита, полный или короткий (например 7bf2895). "
+                    "Берётся из ответа list_commits.")],
+    repo: RepoArg = None,
+) -> dict[str, Any]:
+    return await _guard(gh.commit_details(sha, repo=repo))
+
+
+async def tool_list_issues(
+    state: Annotated[Literal["open", "closed", "all"], Field(
+        description="Какие задачи показать: open — открытые, closed — "
+                    "закрытые, all — любые.")] = "open",
+    limit: Annotated[int, Field(
+        ge=1, le=30, description="Сколько задач вернуть, от 1 до 30.")] = 10,
+    repo: RepoArg = None,
+) -> dict[str, Any]:
+    return await _guard(gh.list_issues(repo=repo, state=state, limit=limit))
+
+
+async def tool_list_files(
+    path: Annotated[str, Field(
+        description="Папка внутри репозитория, например app. Пустая строка — "
+                    "корень репозитория.")] = "",
+    ref: RefArg = None,
+    repo: RepoArg = None,
+) -> dict[str, Any]:
+    return await _guard(gh.list_files(repo=repo, path=path, ref=ref))
+
+
+async def tool_read_file(
+    path: Annotated[str, Field(
+        description="Путь к файлу от корня репозитория, например "
+                    "app/mcp_server.py или README.md.")],
+    ref: RefArg = None,
+    repo: RepoArg = None,
+) -> dict[str, Any]:
+    return await _guard(gh.read_file(path, repo=repo, ref=ref))
 
 
 # Имя → функция и описание. Описание уходит модели как есть, поэтому в нём
-# сразу сказано, что инструмент делает и какие значения допустимы.
+# сразу сказано, что инструмент делает и когда его звать.
 TOOL_SPECS: dict[str, tuple[Callable[..., Any], str]] = {
-    "list_clients": (
-        tool_list_clients,
-        "Список клиентов CRM с их статусом и суммой сделки. Необязательный "
-        "параметр status фильтрует список; допустимые значения: "
-        "новый, в работе, оплачен, отказ.",
+    "repo_info": (
+        tool_repo_info,
+        "Карточка репозитория на GitHub: описание, основной язык, ветка по "
+        "умолчанию, число звёзд и открытых задач, время последней записи.",
     ),
-    "get_client": (
-        tool_get_client,
-        "Карточка одного клиента по его номеру (client_id): имя, статус, "
-        "сумма сделки и заметка менеджера.",
+    "list_commits": (
+        tool_list_commits,
+        "Последние коммиты репозитория: короткий хеш, автор, дата и первая "
+        "строка сообщения. С этого инструмента начинают, когда спрашивают, "
+        "что нового или что менялось.",
     ),
-    "create_client": (
-        tool_create_client,
-        "Завести в CRM нового клиента: name — название, amount — сумма сделки "
-        "в рублях. Новый клиент получает статус «новый».",
+    "commit_details": (
+        tool_commit_details,
+        "Подробности одного коммита по его хешу: полное сообщение, список "
+        "изменённых файлов, сколько строк добавлено и удалено, куски диффа.",
     ),
-    "set_status": (
-        tool_set_status,
-        "Сменить статус клиента с номером client_id. Допустимые значения "
-        "status: новый, в работе, оплачен, отказ.",
+    "list_issues": (
+        tool_list_issues,
+        "Задачи (issues) и pull request'ы репозитория с их номером, "
+        "заголовком, автором и состоянием.",
     ),
-    "stats": (
-        tool_stats,
-        "Сводка по CRM: сколько всего клиентов, общая сумма сделок и разбивка "
-        "по каждому статусу.",
+    "list_files": (
+        tool_list_files,
+        "Содержимое папки репозитория: файлы и вложенные папки с размерами. "
+        "Нужен, чтобы найти путь к файлу перед чтением.",
+    ),
+    "read_file": (
+        tool_read_file,
+        "Текст файла из репозитория по его пути. Большие файлы обрезаются, "
+        "двоичные не читаются.",
     ),
 }
 
 mcp = MCPServer(
-    name="crm",
+    name="github",
     version="1.0",
-    instructions="CRM отдела продаж: клиенты, статусы сделок и суммы.",
+    instructions="Репозиторий на GitHub: коммиты, файлы и задачи. Данные "
+                 "берутся из api.github.com в момент вызова инструмента.",
 )
 
 # Какие инструменты сейчас включены. Выключенный снимается с сервера целиком,
@@ -177,15 +219,29 @@ def set_server(on: bool) -> None:
         _touch()
 
 
-def snapshot() -> dict:
+def _params(fn: Callable[..., Any]) -> list[dict]:
+    """Параметры инструмента для правой панели: имя и обязателен ли он."""
+    return [
+        {"name": name, "required": parameter.default is inspect.Parameter.empty}
+        for name, parameter in inspect.signature(fn).parameters.items()
+    ]
+
+
+def snapshot() -> dict[str, Any]:
     """Состояние сервера для правой панели интерфейса."""
     return {
         "revision": revision,
         "server_on": server_on,
-        "clients": clients,
-        "statuses": STATUSES,
+        "repo": config.GITHUB_REPO,
+        "api": config.GITHUB_API,
+        "auth": gh.auth_state(),
+        "overview": overview,
+        "error": overview_error,
+        "updated": overview_time,
+        "loading": overview_loading,
         "tools": [
-            {"name": name, "description": description, "on": enabled[name]}
-            for name, (_fn, description) in TOOL_SPECS.items()
+            {"name": name, "description": description, "on": enabled[name],
+             "params": _params(fn)}
+            for name, (fn, description) in TOOL_SPECS.items()
         ],
     }
