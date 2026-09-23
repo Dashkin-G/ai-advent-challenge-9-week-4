@@ -69,12 +69,21 @@
   }
   .chip.empty { font-family: inherit; color: var(--muted); }
 
+  .autobar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 22px;
+             border-bottom: 1px solid var(--line); background: var(--panel-soft); }
+  .auto-text { flex: 1; min-width: 240px; }
+  .auto-title { font-size: 20px; font-weight: 640; }
+  .auto-sub { color: var(--muted); font-size: 17.5px; }
+  .autobar select { font-size: 19px; padding: 8px 10px; }
+
   .chat { flex: 1; overflow-y: auto; padding: 22px; display: flex; flex-direction: column; gap: 16px; }
   .msg { max-width: 92%; display: flex; flex-direction: column; gap: 6px; }
   .msg.user { align-self: flex-end; align-items: flex-end; }
   .bubble { padding: 12px 16px; border-radius: 14px; white-space: pre-wrap; word-wrap: break-word; }
   .msg.user .bubble { background: var(--user); border: 1px solid var(--user-line); border-bottom-right-radius: 4px; }
   .msg.bot .bubble { background: var(--panel); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
+  .msg.report .bubble { border-left: 6px solid var(--accent); }
+  .report-head { font-weight: 680; color: var(--accent); margin-bottom: 4px; }
   .msg .meta { color: var(--muted); font-size: 17.5px; display: flex; gap: 10px; flex-wrap: wrap; }
   .meta .used { color: var(--ok); font-family: ui-monospace, Consolas, monospace; }
   .meta .used.bad { color: var(--bad); }
@@ -143,6 +152,25 @@
   }
   .param.optional { color: var(--muted); border-style: dashed; }
 
+  .tool-group { margin-top: 14px; padding-top: 10px; border-top: 2px solid var(--line); }
+  .tool-group:first-child { margin-top: 0; padding-top: 0; border-top: none; }
+  .tool-group + .tool-row { border-top: none; }
+
+  .watch { padding: 12px 0; border-top: 1px solid var(--line); display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  .watch:first-child { border-top: none; }
+  .watch-text { flex: 1; min-width: 240px; }
+  .watch-repo { font-family: ui-monospace, Consolas, monospace; font-size: 19.5px; }
+  .watch.paused .watch-repo { color: var(--muted); }
+  .watch-sub { color: var(--muted); font-size: 17.5px; margin-top: 2px; }
+  .watch-next { font-weight: 600; color: var(--accent); font-variant-numeric: tabular-nums; }
+  .watch-buttons { display: flex; gap: 8px; }
+  .watch-buttons button { font-size: 17px; padding: 7px 12px; }
+  .events-title { margin-top: 14px; }
+  .event { display: flex; gap: 10px; align-items: baseline; padding: 6px 0; font-size: 18.5px; }
+  .event-time { color: var(--muted); font-family: ui-monospace, Consolas, monospace; font-size: 17px; flex: none; }
+  .event-icon { width: 22px; text-align: center; flex: none; }
+  .event-text { overflow: hidden; text-overflow: ellipsis; }
+
   .repo-name { font-size: 22px; font-family: ui-monospace, Consolas, monospace; }
   .repo-desc { color: var(--muted); font-size: 18.5px; margin-top: 4px; }
   .meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 18px; margin-top: 14px; }
@@ -198,6 +226,21 @@
       <div class="error-line" id="conn-error" hidden></div>
     </div>
 
+    <div class="autobar">
+      <div class="auto-text">
+        <div class="auto-title">Автосводка агента</div>
+        <div class="auto-sub" id="auto-status">выключена</div>
+      </div>
+      <select id="auto-every" title="Как часто агент сам спрашивает сводку у сервера">
+        <option value="0">выключена</option>
+        <option value="1">каждую минуту</option>
+        <option value="5">каждые 5 мин</option>
+        <option value="15">каждые 15 мин</option>
+        <option value="60">каждый час</option>
+      </select>
+      <button id="auto-now" title="Спросить watch_summary прямо сейчас">Сводка сейчас</button>
+    </div>
+
     <div class="chat" id="chat"></div>
     <div class="examples" id="examples"></div>
     <div class="composer">
@@ -236,6 +279,14 @@
         <div class="card-title">Инструменты для агента<span class="pill" id="tools-pill"></span></div>
         <div class="card-sub">то, что сервер отдаёт в ответе <code>tools/list</code>: имя, описание и входные параметры (пунктирные — необязательные). Снимите галочку — инструмент пропадёт и у агента.</div>
         <div id="tool-list" style="margin-top:10px"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Наблюдение по расписанию<span class="pill" id="watch-pill"></span></div>
+        <div class="card-sub">задания заводит агент инструментом <code>watch_repo</code>; сервер сам проверяет репозиторий в срок и копит события в SQLite — это переживает перезапуск</div>
+        <div class="rows" id="watches"></div>
+        <div class="label events-title">Последние события</div>
+        <div id="events"></div>
       </div>
 
       <div class="card">
@@ -343,10 +394,95 @@ function render(state) {
     }
   }
 
+  renderReport(state.agent.report, connected);
   renderChat(state.agent.messages);
   renderLog(mcp.log);
   renderServer(srv);
+  renderWatch(state.watch);
   painted = true;
+  tick();
+}
+
+// --- автосводка агента: как часто, что было на прошлом круге, когда следующий
+function renderReport(report, connected) {
+  const select = $('auto-every');
+  if (document.activeElement !== select) select.value = String(report.every);
+  const status = $('auto-status');
+  status.dataset.base = report.status;
+  status.dataset.ts = report.next_ts || '';
+  $('auto-now').disabled = !connected;
+}
+
+// Обратный отсчёт тикает сам, между перерисовками по номеру состояния.
+function countdown(ts) {
+  const left = Math.max(0, Math.round(ts - Date.now() / 1000));
+  return `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
+}
+
+function tick() {
+  const status = $('auto-status');
+  const ts = Number(status.dataset.ts);
+  status.textContent = status.dataset.base + (ts ? ` · следующая через ${countdown(ts)}` : '');
+  for (const el of document.querySelectorAll('[data-next]')) {
+    el.textContent = 'следующая проверка через ' + countdown(Number(el.dataset.next));
+  }
+}
+
+const EVENT_ICONS = {start: '▶', commit: '●', issue_opened: '＋', issue_closed: '✓', stars: '★'};
+const EVENT_WORDS = {start: '', commit: 'коммит', issue_opened: 'открыта', issue_closed: 'закрыта', stars: 'звёзды'};
+
+function renderWatch(watch) {
+  const active = watch.watches.filter((w) => w.active).length;
+  $('watch-pill').textContent = watch.watches.length ? `активно ${active} из ${watch.watches.length}` : '';
+
+  const list = $('watches');
+  list.innerHTML = '';
+  if (!watch.watches.length) {
+    list.innerHTML = '<div class="empty-row">наблюдений нет — попросите агента: «следи за репозиторием раз в минуту»</div>';
+  }
+  for (const w of watch.watches) {
+    const row = document.createElement('div');
+    row.className = 'watch' + (w.active ? '' : ' paused');
+    row.innerHTML = '<div class="watch-text"><div class="watch-repo"></div><div class="watch-sub"></div>' +
+      '<div class="watch-sub watch-next"></div></div><div class="watch-buttons"></div>';
+    row.querySelector('.watch-repo').textContent = `№${w.id} · ${w.repo}`;
+    row.querySelector('.watch-sub').textContent =
+      `каждые ${w.every} мин · проверок ${w.runs} · событий ${w.events}` +
+      (w.last_run ? ` · последняя в ${w.last_run}` : '') + (w.error ? ` · ошибка: ${w.error}` : '');
+    const next = row.querySelector('.watch-next');
+    if (w.active) next.dataset.next = w.next_ts; else next.textContent = 'на паузе';
+
+    const buttons = row.querySelector('.watch-buttons');
+    const actions = [
+      ['Проверить сейчас', () => post(`/api/watch/${w.id}/run`)],
+      [w.active ? 'Пауза' : 'Продолжить', () => post(`/api/watch/${w.id}/active`, {on: !w.active})],
+      ['Удалить', () => post(`/api/watch/${w.id}/delete`)],
+    ];
+    for (const [label, action] of actions) {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.onclick = action;
+      buttons.appendChild(b);
+    }
+    list.appendChild(row);
+  }
+
+  const events = $('events');
+  events.innerHTML = '';
+  if (!watch.events.length) {
+    events.innerHTML = '<div class="empty-row">пока пусто: события появятся после первой проверки</div>';
+  }
+  for (const e of watch.events) {
+    const row = document.createElement('div');
+    row.className = 'event';
+    row.innerHTML = '<span class="event-time"></span><span class="event-icon"></span><span class="event-text"></span>';
+    row.querySelector('.event-time').textContent = e.time;
+    row.querySelector('.event-icon').textContent = EVENT_ICONS[e.kind] || '•';
+    const who = e.author ? ` — ${e.author}` : '';
+    const ref = e.kind === 'start' ? '' : `${EVENT_WORDS[e.kind]} ${e.ref}: `;
+    row.querySelector('.event-text').textContent = ref + e.title + who;
+    events.appendChild(row);
+  }
 }
 
 function renderServer(srv) {
@@ -369,7 +505,15 @@ function renderServer(srv) {
   $('tools-pill').textContent = `включено ${on} из ${srv.tools.length}`;
   const list = $('tool-list');
   list.innerHTML = '';
+  let group = null;
   for (const tool of srv.tools) {
+    if (tool.scheduled !== group) {
+      group = tool.scheduled;
+      const head = document.createElement('div');
+      head.className = 'label tool-group';
+      head.textContent = group ? 'по расписанию — наблюдение и сводка' : 'по запросу — живой GitHub';
+      list.appendChild(head);
+    }
     const row = document.createElement('label');
     row.className = 'tool-row' + (tool.on ? '' : ' off');
     const box = document.createElement('input');
@@ -489,10 +633,16 @@ function renderChat(messages) {
 
   for (const m of messages) {
     const wrap = document.createElement('div');
-    wrap.className = 'msg ' + (m.role === 'user' ? 'user' : 'bot');
+    wrap.className = 'msg ' + (m.role === 'user' ? 'user' : 'bot') + (m.kind === 'report' ? ' report' : '');
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
     bubble.innerHTML = markup(m.text);
+    if (m.kind === 'report') {
+      const head = document.createElement('div');
+      head.className = 'report-head';
+      head.textContent = `📋 Сводка агента · ${m.time} — пришла сама, без вопроса`;
+      bubble.prepend(head);
+    }
     wrap.appendChild(bubble);
 
     if (m.role === 'assistant') {
@@ -572,6 +722,8 @@ $('input').onkeydown = (e) => {
 };
 $('btn-refresh').onclick = () => post('/api/mcp/refresh');
 $('repo-refresh').onclick = () => post('/api/repo/refresh');
+$('auto-every').onchange = (e) => post('/api/report', {minutes: Number(e.target.value)});
+$('auto-now').onclick = () => post('/api/report/now');
 
 for (const text of EXAMPLES) {
   const chip = document.createElement('button');
@@ -583,6 +735,7 @@ for (const text of EXAMPLES) {
 
 refresh(true);
 setInterval(() => refresh(false), 1200);
+setInterval(tick, 1000);
 </script>
 </body>
 </html>

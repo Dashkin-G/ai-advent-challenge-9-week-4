@@ -376,6 +376,31 @@ async def overview(repo: str | None = None) -> dict:
     }
 
 
+async def pulse(repo: str | None = None) -> dict:
+    """Пульс репозитория для наблюдения по расписанию: звёзды, коммиты, задачи.
+
+    Три запроса за раз. Коммитов берём 30, открытых задач — до 100: по
+    разнице между двумя такими снимками и видно, что появилось и что закрылось.
+    """
+    name = repo_name(repo)
+    info, commits, issues = await asyncio.gather(
+        get("/repos/" + name),
+        get("/repos/{0}/commits".format(name), per_page=30),
+        get("/repos/{0}/issues".format(name), state="open", per_page=100),
+    )
+    return {
+        "repo": name,
+        "stars": info.get("stargazers_count"),
+        "commits": [_commit_row(item) for item in commits],
+        "issues": [
+            {"number": item.get("number"), "title": item.get("title"),
+             "author": (item.get("user") or {}).get("login"),
+             "kind": "pull request" if item.get("pull_request") else "задача"}
+            for item in issues
+        ],
+    }
+
+
 def auth_state() -> dict:
     """Как мы ходим в GitHub и сколько запросов осталось — для панели."""
     return {

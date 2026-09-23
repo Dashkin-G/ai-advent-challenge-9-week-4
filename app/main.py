@@ -4,7 +4,8 @@
   * чат с агентом     — интерфейс на / и небольшой HTTP-API на /api.
 
 Агент ходит в MCP-сервер по сети, как ходил бы любой внешний клиент, а сервер
-за каждым ответом ходит в api.github.com.
+за каждым ответом ходит в api.github.com. Фоном всё время работают планировщик
+наблюдения (watcher.py) и, если включена, автосводка агента.
 
 Запуск: python -m app.main  →  http://127.0.0.1:8000
 """
@@ -18,7 +19,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import agent, config
+from . import agent, config, watcher
 from . import github_api as gh
 from . import mcp_server as srv
 from .mcp_server import mcp
@@ -54,8 +55,14 @@ async def lifespan(app: FastAPI):
         # Сводку для правой панели тянем фоном: старт приложения не должен
         # ждать, пока ответит GitHub.
         warmup = asyncio.create_task(srv.refresh_overview())
+        # Планировщик наблюдения работает всё время жизни приложения; нашёл
+        # новое — правая панель перечитывает репозиторий сама.
+        watcher.on_news = srv.refresh_overview
+        scheduler = asyncio.create_task(watcher.run_forever())
         yield
         warmup.cancel()
+        scheduler.cancel()
+        agent.report.stop()
         await agent.link.disconnect("остановка приложения")
         await gh.close()
 
@@ -94,8 +101,8 @@ def index() -> FileResponse:
 
 @app.get("/api/state")
 def state() -> dict:
-    return {"agent": agent.snapshot(), "server": srv.snapshot(),
-            "revision": agent.revision + srv.revision}
+    return {"agent": agent.snapshot(), "server": srv.snapshot(), "watch": watcher.snapshot(),
+            "revision": agent.revision + srv.revision + watcher.revision}
 
 
 def _done(error: str | None = None) -> dict:
@@ -152,6 +159,27 @@ def chat_clear() -> dict:
     return _done()
 
 
+class Every(BaseModel):
+    minutes: int
+
+
+@app.post("/api/report")
+async def report_every(req: Every) -> dict:
+    """Автосводка агента: раз в сколько минут (0 — выключить).
+
+    Обработчик асинхронный намеренно: цикл автосводки заводится задачей в
+    событийном цикле, а синхронный обработчик FastAPI выполнил бы в потоке.
+    """
+    agent.report.set(max(0, req.minutes))
+    return _done()
+
+
+@app.post("/api/report/now")
+async def report_now() -> dict:
+    await agent.report.run_once()
+    return _done()
+
+
 # --- правая половина: сервер, его инструменты и сам репозиторий -------------
 
 class Switch(BaseModel):
@@ -190,6 +218,25 @@ async def tool_switch(req: ToolSwitch) -> dict:
 async def repo_refresh() -> dict:
     """Перечитать репозиторий для правой панели (тот же GitHub, но для глаз)."""
     return _done(await srv.refresh_overview())
+
+
+@app.post("/api/watch/{watch_id}/run")
+async def watch_run(watch_id: int) -> dict:
+    """Проверить репозиторий сейчас, не дожидаясь срока."""
+    await watcher.collect(watch_id)
+    return _done()
+
+
+@app.post("/api/watch/{watch_id}/active")
+async def watch_active(watch_id: int, req: Switch) -> dict:
+    watcher.set_active(watch_id, req.on)
+    return _done()
+
+
+@app.post("/api/watch/{watch_id}/delete")
+async def watch_delete(watch_id: int) -> dict:
+    watcher.remove(watch_id)
+    return _done()
 
 
 if __name__ == "__main__":

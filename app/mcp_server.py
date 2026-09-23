@@ -2,8 +2,10 @@
 
 Это первая половина проекта. Сервер поднимается внутри того же процесса, что и
 чат (см. `main.py`), но общается с агентом по протоколу MCP — транспорт
-streamable HTTP на `/mcp`. Данные он не придумывает и не хранит: каждый вызов
-инструмента — это живой запрос к api.github.com (см. `github_api.py`).
+streamable HTTP на `/mcp`. Данные он не придумывает: шесть инструментов делают
+живой запрос к api.github.com (см. `github_api.py`), а три инструмента
+наблюдения заводят задание по расписанию и отдают накопленную в SQLite сводку
+(см. `watcher.py`).
 
 Что здесь происходит по пунктам задания:
 
@@ -27,6 +29,7 @@ from pydantic import Field
 
 from . import config
 from . import github_api as gh
+from . import watcher
 
 # Номер состояния: растёт на каждое изменение настроек сервера или панели.
 # По нему интерфейс понимает, что пора перерисовать правую половину.
@@ -148,6 +151,48 @@ async def tool_read_file(
     return await _guard(gh.read_file(path, repo=repo, ref=ref))
 
 
+# --- Инструменты с отложенным выполнением: наблюдение по расписанию ----------
+# Вызов не отвечает на вопрос сразу, а заводит задание: дальше планировщик сам
+# снимает пульс репозитория и копит события в SQLite (см. watcher.py).
+
+async def tool_watch_repo(
+    every_minutes: Annotated[int, Field(
+        ge=1, le=1440,
+        description="Как часто проверять репозиторий, в минутах: от 1 до 1440 "
+                    "(раз в сутки).")] = 60,
+    repo: RepoArg = None,
+) -> dict[str, Any]:
+    return await _guard(watcher.add(repo or config.GITHUB_REPO, every_minutes))
+
+
+async def tool_watch_summary(
+    minutes: Annotated[int, Field(
+        ge=1, le=10080,
+        description="За какой период свести события, в минутах: 60 — за час, "
+                    "1440 — за сутки, до 10080 — за неделю.")] = 60,
+    after_id: Annotated[int, Field(
+        ge=0,
+        description="Вернуть только события новее этого номера. Нужен для "
+                    "регулярной сводки, чтобы не повторяться; 0 — все за период.")] = 0,
+    repo: Annotated[str | None, Field(
+        description="Свести только по этому репозиторию («владелец/имя»). "
+                    "По умолчанию — по всем наблюдениям.")] = None,
+) -> dict[str, Any]:
+    try:
+        return watcher.summary(minutes=minutes, repo=repo, after_id=after_id)
+    except gh.GitHubError as e:
+        return {"ошибка": str(e)}
+
+
+async def tool_stop_watch(
+    watch_id: Annotated[int, Field(
+        description="Номер наблюдения из ответа watch_repo или watch_summary.")],
+) -> dict[str, Any]:
+    if watcher.remove(watch_id):
+        return {"результат": "наблюдение №{0} остановлено и удалено".format(watch_id)}
+    return {"ошибка": "наблюдения №{0} нет".format(watch_id)}
+
+
 # Имя → функция и описание. Описание уходит модели как есть, поэтому в нём
 # сразу сказано, что инструмент делает и когда его звать.
 TOOL_SPECS: dict[str, tuple[Callable[..., Any], str]] = {
@@ -182,13 +227,34 @@ TOOL_SPECS: dict[str, tuple[Callable[..., Any], str]] = {
         "Текст файла из репозитория по его пути. Большие файлы обрезаются, "
         "двоичные не читаются.",
     ),
+    "watch_repo": (
+        tool_watch_repo,
+        "Поставить репозиторий на наблюдение по расписанию: сервер будет сам "
+        "проверять его каждые N минут и записывать новые коммиты, задачи и "
+        "звёзды. Повторный вызов для того же репозитория меняет интервал.",
+    ),
+    "watch_summary": (
+        tool_watch_summary,
+        "Агрегированная сводка наблюдения за период: сколько было проверок, "
+        "какие коммиты появились и от кого, какие задачи открыты и закрыты, "
+        "как изменились звёзды. Отвечай по ней на «что произошло за час / день».",
+    ),
+    "stop_watch": (
+        tool_stop_watch,
+        "Остановить наблюдение и удалить его историю. Номер наблюдения — из "
+        "ответа watch_repo или watch_summary.",
+    ),
 }
+
+# Инструменты, которые работают по расписанию, — в панели они отдельной группой.
+SCHEDULED = {"watch_repo", "watch_summary", "stop_watch"}
 
 mcp = MCPServer(
     name="github",
     version="1.0",
     instructions="Репозиторий на GitHub: коммиты, файлы и задачи. Данные "
-                 "берутся из api.github.com в момент вызова инструмента.",
+                 "берутся из api.github.com в момент вызова инструмента, а "
+                 "наблюдение по расписанию копит события и отдаёт сводку.",
 )
 
 # Какие инструменты сейчас включены. Выключенный снимается с сервера целиком,
@@ -241,7 +307,7 @@ def snapshot() -> dict[str, Any]:
         "loading": overview_loading,
         "tools": [
             {"name": name, "description": description, "on": enabled[name],
-             "params": _params(fn)}
+             "params": _params(fn), "scheduled": name in SCHEDULED}
             for name, (fn, description) in TOOL_SPECS.items()
         ],
     }

@@ -4,6 +4,9 @@
 клиентом из SDK (`mcp.Client`) по сети, получает от него список инструментов и
 отдаёт этот список модели. Всё, что уходит по протоколу и приходит обратно,
 попадает в журнал обмена — его видно в интерфейсе.
+
+Кроме ответов на вопросы агент умеет работать сам: `AutoReport` раз в N минут
+спрашивает у сервера сводку наблюдения и присылает её в чат.
 """
 import asyncio
 import json
@@ -24,7 +27,10 @@ SYSTEM = (
     "инструменты MCP-сервера. Ничего не придумывай: нет инструмента — так и скажи.\n"
     "Если нужен хеш коммита или путь к файлу, сначала возьми список, а потом "
     "запрашивай подробности. Опирайся на то, что вернули инструменты: хеши, "
-    "даты, имена файлов, номера задач."
+    "даты, имена файлов, номера задач.\n"
+    "Если просят следить за репозиторием или присылать сводку — заведи наблюдение "
+    "инструментом watch_repo. На вопросы «что произошло за час / за день» отвечай "
+    "по watch_summary."
 )
 NO_TOOLS_NOTE = (
     "\nСейчас соединение с MCP-сервером не установлено и инструментов у тебя нет. "
@@ -300,10 +306,117 @@ async def ask(text: str) -> dict:
     return reply
 
 
+REPORT_SYSTEM = (
+    "Ты пишешь регулярную сводку по репозиторию на GitHub для команды. На входе — "
+    "агрегированный ответ инструмента watch_summary. Напиши 2–5 коротких строк "
+    "по-русски: что изменилось, кто автор, сколько. Хеши коммитов и номера задач "
+    "оставляй. Без вступлений и без советов; ничего сверх данных не придумывай."
+)
+
+
+class AutoReport:
+    """Агент, который работает сам: раз в N минут спрашивает сводку у сервера.
+
+    Цикл живёт фоновой задачей и не зависит от того, открыт ли браузер. Каждый
+    круг — вызов watch_summary по MCP (виден в журнале). Модель зовётся, только
+    если с прошлой сводки что-то изменилось: тишина квоту не тратит.
+    """
+
+    def __init__(self) -> None:
+        self.every = 0            # минут; 0 — выключена
+        self.last_id = 0          # последнее событие, о котором уже рассказали
+        self.since: datetime | None = None   # с какого момента собирать события
+        self.status = "выключена"
+        self.next_ts: float | None = None
+        self._task: asyncio.Task | None = None
+
+    def _say(self, status: str) -> None:
+        self.status = status
+        _touch()
+
+    def set(self, minutes: int) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+        self.every = minutes
+        self.next_ts = None
+        if minutes:
+            self._task = asyncio.create_task(self._loop())
+            self._say("включена: сводка каждые {0} мин".format(minutes))
+        else:
+            self._say("выключена")
+
+    async def _loop(self) -> None:
+        while True:
+            self.next_ts = time.time() + self.every * 60
+            _touch()
+            await asyncio.sleep(self.every * 60)
+            await self.run_once()
+
+    async def run_once(self) -> None:
+        """Один круг: спросить сводку и, если есть новости, написать её в чат."""
+        now = datetime.now().strftime("%H:%M")
+        if not link.connected:
+            self._say("{0} — пропуск: нет соединения с MCP-сервером".format(now))
+            return
+        if "watch_summary" not in {t["name"] for t in link.tools}:
+            self._say("{0} — пропуск: инструмент watch_summary выключен на сервере".format(now))
+            return
+
+        started = time.perf_counter()
+        # Первая сводка — за последний час, дальше — с момента прошлой сводки.
+        minutes = 60 if self.since is None else max(1, min(
+            10080, int((datetime.now() - self.since).total_seconds() // 60) + 1))
+        arguments = {"minutes": minutes, "after_id": self.last_id}
+        try:
+            raw = await link.call_tool("watch_summary", arguments)
+            data = json.loads(raw)
+        except Exception as e:
+            self._say("{0} — ошибка: {1}".format(now, _reason(e)))
+            return
+        if not data.get("есть изменения"):
+            self.last_id = data.get("последнее событие №", self.last_id)
+            self._say("{0} — изменений нет, модель не вызывалась".format(now))
+            return
+
+        try:
+            response = await asyncio.to_thread(_call_model, [
+                {"role": "system", "content": REPORT_SYSTEM},
+                {"role": "user", "content": raw},
+            ], [])
+        except Exception as e:  # модель недоступна — события не теряем, скажем в следующий раз
+            self._say("{0} — модель не ответила: {1}".format(now, e))
+            return
+        self.last_id = data.get("последнее событие №", self.last_id)
+        self.since = datetime.now()
+        history.append({
+            "role": "assistant",
+            "kind": "report",
+            "time": now,
+            "text": (response.choices[0].message.content or "").strip() or "Модель вернула пустую сводку.",
+            "calls": [{"name": "watch_summary", "arguments": arguments, "ok": True}],
+            "tokens": response.usage.total_tokens if response.usage else 0,
+            "seconds": round(time.perf_counter() - started, 1),
+        })
+        self._say("{0} — сводка отправлена в чат".format(now))
+
+    def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+
+    def snapshot(self) -> dict:
+        return {"every": self.every, "status": self.status, "next_ts": self.next_ts}
+
+
+report = AutoReport()
+
+
 def clear_history() -> None:
     history.clear()
     _touch()
 
 
 def snapshot() -> dict:
-    return {"revision": revision, "messages": history, "mcp": link.snapshot(), "model": config.MODEL}
+    return {"revision": revision, "messages": history, "mcp": link.snapshot(),
+            "model": config.MODEL, "report": report.snapshot()}

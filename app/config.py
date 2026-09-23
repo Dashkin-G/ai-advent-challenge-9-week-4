@@ -29,6 +29,11 @@ GITHUB_API = os.getenv("GITHUB_API", "https://api.github.com")
 # взять токен у GitHub CLI (`gh auth token`) — см. github_api.py.
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
+# --- Наблюдение по расписанию ---
+# Задания, снимки и события живут в SQLite: наблюдение переживает перезапуск
+# приложения и продолжается с того места, где остановилось.
+WATCH_DB = os.getenv("WATCH_DB", os.path.join("data", "watch.db"))
+
 # --- Сеть ---
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8000"))
