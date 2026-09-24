@@ -34,6 +34,11 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 # приложения и продолжается с того места, где остановилось.
 WATCH_DB = os.getenv("WATCH_DB", os.path.join("data", "watch.db"))
 
+# --- Пайплайн: поиск → сводка → файл ---
+# Сюда инструмент save_to_file пишет отчёты. Тот же запрос перезаписывает свой
+# файл, поэтому отчёты не копятся.
+REPORTS_DIR = os.getenv("REPORTS_DIR", os.path.join("data", "reports"))
+
 # --- Сеть ---
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8000"))

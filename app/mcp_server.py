@@ -3,7 +3,8 @@
 Это первая половина проекта. Сервер поднимается внутри того же процесса, что и
 чат (см. `main.py`), но общается с агентом по протоколу MCP — транспорт
 streamable HTTP на `/mcp`. Данные он не придумывает: шесть инструментов делают
-живой запрос к api.github.com (см. `github_api.py`), а три инструмента
+живой запрос к api.github.com (см. `github_api.py`), три складываются в
+пайплайн «поиск → сводка → файл» (см. `reports.py`), а три инструмента
 наблюдения заводят задание по расписанию и отдают накопленную в SQLite сводку
 (см. `watcher.py`).
 
@@ -29,7 +30,7 @@ from pydantic import Field
 
 from . import config
 from . import github_api as gh
-from . import watcher
+from . import reports, watcher
 
 # Номер состояния: растёт на каждое изменение настроек сервера или панели.
 # По нему интерфейс понимает, что пора перерисовать правую половину.
@@ -86,10 +87,10 @@ RefArg = Annotated[str | None, Field(
 
 
 async def _guard(work: Awaitable[dict[str, Any]]) -> dict[str, Any]:
-    """Ошибку GitHub отдаём агенту словами, а не падением инструмента."""
+    """Ошибку GitHub или шага пайплайна отдаём агенту словами, а не падением."""
     try:
         return await work
-    except gh.GitHubError as e:
+    except (gh.GitHubError, reports.ReportError) as e:
         return {"ошибка": str(e)}
 
 
@@ -149,6 +150,50 @@ async def tool_read_file(
     repo: RepoArg = None,
 ) -> dict[str, Any]:
     return await _guard(gh.read_file(path, repo=repo, ref=ref))
+
+
+# --- Пайплайн: поиск → сводка → файл -----------------------------------------
+# Три инструмента складываются в цепочку: ответ одного целиком уходит на вход
+# следующему. Каждый сообщает отпечаток того, что получил, — по нему агент
+# проверяет, что данные дошли без потерь.
+
+async def tool_search_code(
+    query: Annotated[str, Field(
+        min_length=2,
+        description="Что искать: слово, имя функции или кусок строки, от 2 символов. "
+                    "Регистр не важен.")],
+    path: Annotated[str, Field(
+        description="Искать только в этой папке или файле, например app. Пустая "
+                    "строка — во всём репозитории.")] = "",
+    repo: RepoArg = None,
+) -> dict[str, Any]:
+    found = await _guard(gh.search_code(query, repo=repo, path=path))
+    if "ошибка" not in found:
+        found["отпечаток"] = reports.fingerprint(found)
+    return found
+
+
+async def tool_summarize(
+    found: Annotated[dict[str, Any], Field(
+        description="Ответ search_code целиком, как он пришёл: запрос, репозиторий "
+                    "и список «совпадения» (файл, строка, текст).")],
+) -> dict[str, Any]:
+    return await _guard(reports.summarize(found))
+
+
+async def tool_save_to_file(
+    name: Annotated[str, Field(
+        min_length=1, max_length=80,
+        description="Имя файла без расширения, например watch_summary. Файл ляжет в "
+                    "data/reports/<имя>.md; то же имя перезапишет прошлый отчёт.")],
+    content: Annotated[str, Field(
+        min_length=1, max_length=200_000,
+        description="Что сохранить: обычно поле «отчёт» из ответа summarize.")],
+) -> dict[str, Any]:
+    try:
+        return reports.save(name, content)
+    except OSError as e:
+        return {"ошибка": "файл не записан: {0}".format(e)}
 
 
 # --- Инструменты с отложенным выполнением: наблюдение по расписанию ----------
@@ -227,6 +272,23 @@ TOOL_SPECS: dict[str, tuple[Callable[..., Any], str]] = {
         "Текст файла из репозитория по его пути. Большие файлы обрезаются, "
         "двоичные не читаются.",
     ),
+    "search_code": (
+        tool_search_code,
+        "Поиск по коду репозитория: все строки, где встречается слово или имя, с "
+        "файлом, номером строки и функцией, внутри которой стоит строка. Первый "
+        "шаг пайплайна: его ответ целиком передают в summarize.",
+    ),
+    "summarize": (
+        tool_summarize,
+        "Сводка найденного: модель коротко описывает, что это и где используется, "
+        "а инструмент собирает отчёт в Markdown. На вход — ответ search_code "
+        "целиком; поле «отчёт» из ответа передают в save_to_file.",
+    ),
+    "save_to_file": (
+        tool_save_to_file,
+        "Сохранить текст в файл data/reports/<имя>.md на сервере. Последний шаг "
+        "пайплайна: сохраняет отчёт, который собрал summarize.",
+    ),
     "watch_repo": (
         tool_watch_repo,
         "Поставить репозиторий на наблюдение по расписанию: сервер будет сам "
@@ -246,15 +308,19 @@ TOOL_SPECS: dict[str, tuple[Callable[..., Any], str]] = {
     ),
 }
 
-# Инструменты, которые работают по расписанию, — в панели они отдельной группой.
+# Группы инструментов в правой панели: пайплайн и расписание — отдельно от
+# обычных запросов к GitHub.
+PIPELINE = {"search_code", "summarize", "save_to_file"}
 SCHEDULED = {"watch_repo", "watch_summary", "stop_watch"}
 
 mcp = MCPServer(
     name="github",
     version="1.0",
     instructions="Репозиторий на GitHub: коммиты, файлы и задачи. Данные "
-                 "берутся из api.github.com в момент вызова инструмента, а "
-                 "наблюдение по расписанию копит события и отдаёт сводку.",
+                 "берутся из api.github.com в момент вызова инструмента. "
+                 "Пайплайн search_code → summarize → save_to_file ищет по коду, "
+                 "сводит найденное и сохраняет отчёт в файл, а наблюдение по "
+                 "расписанию копит события и отдаёт сводку.",
 )
 
 # Какие инструменты сейчас включены. Выключенный снимается с сервера целиком,
@@ -307,7 +373,8 @@ def snapshot() -> dict[str, Any]:
         "loading": overview_loading,
         "tools": [
             {"name": name, "description": description, "on": enabled[name],
-             "params": _params(fn), "scheduled": name in SCHEDULED}
+             "params": _params(fn),
+             "group": "pipeline" if name in PIPELINE else "schedule" if name in SCHEDULED else "live"}
             for name, (fn, description) in TOOL_SPECS.items()
         ],
     }

@@ -5,7 +5,8 @@
 
 Агент ходит в MCP-сервер по сети, как ходил бы любой внешний клиент, а сервер
 за каждым ответом ходит в api.github.com. Фоном всё время работают планировщик
-наблюдения (watcher.py) и, если включена, автосводка агента.
+наблюдения (watcher.py) и, если включена, автосводка агента; по кнопке агент
+проводит пайплайн «поиск → сводка → файл».
 
 Запуск: python -m app.main  →  http://127.0.0.1:8000
 """
@@ -19,7 +20,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import agent, config, watcher
+from . import agent, config, reports, watcher
 from . import github_api as gh
 from . import mcp_server as srv
 from .mcp_server import mcp
@@ -63,6 +64,7 @@ async def lifespan(app: FastAPI):
         warmup.cancel()
         scheduler.cancel()
         agent.report.stop()
+        agent.pipeline.stop()
         await agent.link.disconnect("остановка приложения")
         await gh.close()
 
@@ -102,7 +104,8 @@ def index() -> FileResponse:
 @app.get("/api/state")
 def state() -> dict:
     return {"agent": agent.snapshot(), "server": srv.snapshot(), "watch": watcher.snapshot(),
-            "revision": agent.revision + srv.revision + watcher.revision}
+            "reports": reports.listing(),
+            "revision": agent.revision + srv.revision + watcher.revision + reports.revision}
 
 
 def _done(error: str | None = None) -> dict:
@@ -178,6 +181,36 @@ async def report_every(req: Every) -> dict:
 async def report_now() -> dict:
     await agent.report.run_once()
     return _done()
+
+
+@app.post("/api/pipeline")
+async def pipeline_run(req: Ask) -> dict:
+    """Пайплайн «поиск → сводка → файл» по запросу. Ход шагов виден в /api/state.
+
+    Обработчик асинхронный: цепочка заводится задачей в событийном цикле.
+    """
+    query = req.text.strip()
+    if len(query) < 2:
+        return _done("запрос короче двух символов")
+    try:
+        agent.pipeline.start(query)
+    except RuntimeError as e:
+        return _done(str(e))
+    return _done()
+
+
+@app.get("/api/reports/{name}")
+def report_file(name: str):
+    """Отчёт, который записал save_to_file, — открывается в браузере текстом."""
+    path = reports.find(name)
+    if path is None:
+        return JSONResponse({"ok": False, "error": "такого отчёта нет"}, status_code=404)
+    return FileResponse(path, media_type="text/plain; charset=utf-8")
+
+
+@app.post("/api/reports/{name}/delete")
+def report_delete(name: str) -> dict:
+    return _done(None if reports.remove(name) else "такого отчёта нет")
 
 
 # --- правая половина: сервер, его инструменты и сам репозиторий -------------

@@ -76,20 +76,49 @@
   .auto-sub { color: var(--muted); font-size: 17.5px; }
   .autobar select { font-size: 19px; padding: 8px 10px; }
 
-  .chat { flex: 1; overflow-y: auto; padding: 22px; display: flex; flex-direction: column; gap: 16px; }
+  /* Пайплайн: три шага в ряд, между ними стрелка — ответ шага уходит дальше. */
+  .pipe { padding: 12px 22px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .pipe-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .pipe-head input { width: 280px; font-size: 19px; padding: 8px 12px; }
+  #pipe-run { min-width: 140px; }
+  #pipe-status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .stages { display: flex; align-items: stretch; gap: 6px; margin-top: 10px; }
+  .stage {
+    flex: 1 1 0; min-width: 0; padding: 7px 12px 8px; border-radius: 10px;
+    background: var(--field); border: 2px dashed var(--line); line-height: 1.35;
+  }
+  .stage-head { display: flex; gap: 8px; align-items: baseline; white-space: nowrap; overflow: hidden; }
+  .stage-title { font-size: 18px; font-weight: 680; }
+  .stage-tool { font: 16px ui-monospace, Consolas, monospace; color: var(--muted); }
+  .stage-text { font-size: 18.5px; margin-top: 2px; overflow-wrap: anywhere; }
+  .stage-sub { font-size: 16.5px; color: var(--muted); font-variant-numeric: tabular-nums; min-height: 1.35em; }
+  .stage.run { border: 2px solid var(--accent); animation: pulse 1.4s ease-in-out infinite; }
+  .stage.done { border: 2px solid var(--accent); }
+  .stage.error { border: 2px solid var(--bad); }
+  .stage.error .stage-text { color: var(--bad); font-weight: 600; }
+  .stage.skip { opacity: .55; }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 5px rgba(23,53,28,.28); } }
+  .arrow { flex: none; align-self: center; font-size: 24px; color: var(--muted); opacity: .45; }
+  .arrow.flow, .arrow.ok { color: var(--accent); opacity: 1; }
+  .arrow.bad { color: var(--bad); opacity: 1; }
+
+  .chat { flex: 1; overflow-y: auto; padding: 22px; display: flex; flex-direction: column; gap: 16px; position: relative; }
   .msg { max-width: 92%; display: flex; flex-direction: column; gap: 6px; }
   .msg.user { align-self: flex-end; align-items: flex-end; }
   .bubble { padding: 12px 16px; border-radius: 14px; white-space: pre-wrap; word-wrap: break-word; }
   .msg.user .bubble { background: var(--user); border: 1px solid var(--user-line); border-bottom-right-radius: 4px; }
   .msg.bot .bubble { background: var(--panel); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
   .msg.report .bubble { border-left: 6px solid var(--accent); }
+  .bubble code { font: .9em ui-monospace, Consolas, monospace; background: rgba(255,255,255,.2); border-radius: 5px; padding: 0 4px; }
   .report-head { font-weight: 680; color: var(--accent); margin-bottom: 4px; }
   .msg .meta { color: var(--muted); font-size: 17.5px; display: flex; gap: 10px; flex-wrap: wrap; }
   .meta .used { color: var(--ok); font-family: ui-monospace, Consolas, monospace; }
   .meta .used.bad { color: var(--bad); }
-  .empty-chat { color: var(--muted); font-size: 20px; margin: auto; text-align: center; max-width: 540px; }
+  .empty-chat { color: var(--muted); font-size: 20px; margin: auto; text-align: center; max-width: 780px; }
+  .empty-chat p { margin: 0 auto; max-width: 540px; }
 
-  .examples { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 22px 12px; }
+  /* Примеры вопросов живут в пустом чате: начался разговор — место отдаём сообщениям. */
+  .examples { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 14px; }
   .example {
     background: transparent; border: 1px dashed var(--line); color: var(--muted);
     border-radius: 999px; padding: 7px 14px; font-size: 18px;
@@ -156,6 +185,7 @@
   .tool-group:first-child { margin-top: 0; padding-top: 0; border-top: none; }
   .tool-group + .tool-row { border-top: none; }
 
+  /* Строка задания наблюдения; так же выглядят и файлы отчётов. */
   .watch { padding: 12px 0; border-top: 1px solid var(--line); display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
   .watch:first-child { border-top: none; }
   .watch-text { flex: 1; min-width: 240px; }
@@ -241,8 +271,20 @@
       <button id="auto-now" title="Спросить watch_summary прямо сейчас">Сводка сейчас</button>
     </div>
 
+    <div class="pipe">
+      <div class="pipe-head">
+        <div class="auto-text">
+          <div class="auto-title">Пайплайн агента</div>
+          <div class="auto-sub" id="pipe-status">—</div>
+        </div>
+        <input id="pipe-query" placeholder="например, watch_summary" autocomplete="off"
+               title="Что искать в коде репозитория" />
+        <button class="primary" id="pipe-run">Запустить</button>
+      </div>
+      <div class="stages" id="stages"></div>
+    </div>
+
     <div class="chat" id="chat"></div>
-    <div class="examples" id="examples"></div>
     <div class="composer">
       <textarea id="input" rows="2" placeholder="Например: что изменилось в последнем коммите?"></textarea>
       <button class="primary" id="send">Отправить</button>
@@ -279,6 +321,12 @@
         <div class="card-title">Инструменты для агента<span class="pill" id="tools-pill"></span></div>
         <div class="card-sub">то, что сервер отдаёт в ответе <code>tools/list</code>: имя, описание и входные параметры (пунктирные — необязательные). Снимите галочку — инструмент пропадёт и у агента.</div>
         <div id="tool-list" style="margin-top:10px"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Отчёты на диске<span class="pill" id="reports-pill"></span></div>
+        <div class="card-sub">их пишет инструмент <code>save_to_file</code> в папку <code>data/reports</code>; тот же запрос перезаписывает свой файл</div>
+        <div class="rows" id="reports"></div>
       </div>
 
       <div class="card">
@@ -333,6 +381,7 @@ let lastError = '';      // ошибка последнего действия
 const openLogs = new Set();   // раскрытые строки журнала переживают перерисовку
 const seenCommits = new Set(); // чтобы подсветить приехавший коммит
 let painted = false;          // первая отрисовка ничего не подсвечивает
+let fast = false;             // идёт пайплайн — опрашиваем чаще
 
 const $ = (id) => document.getElementById(id);
 
@@ -395,12 +444,95 @@ function render(state) {
   }
 
   renderReport(state.agent.report, connected);
+  renderPipeline(state.agent.pipeline, connected);
   renderChat(state.agent.messages);
   renderLog(mcp.log);
   renderServer(srv);
+  renderReports(state.reports);
   renderWatch(state.watch);
   painted = true;
   tick();
+}
+
+// --- пайплайн: три шага, каждый — отдельный tools/call; стрелка — передача данных
+const STEP_NUMBERS = ['①', '②', '③'];
+const STEP_ICONS = {idle: '', run: '', done: '✓ ', error: '✕ ', skip: ''};
+const STEP_DOING = ['ищем строки в коде через GitHub', 'модель пишет сводку', 'записываем отчёт на диск'];
+
+function renderPipeline(pipe, connected) {
+  fast = pipe.running;
+  const run = $('pipe-run');
+  run.disabled = !connected || pipe.running;
+  run.textContent = pipe.running ? 'Идёт…' : 'Запустить';
+
+  const current = pipe.steps.findIndex((s) => s.state === 'run');
+  const status = $('pipe-status');
+  status.textContent = pipe.running
+    ? `шаг ${current + 1} из 3: ${STEP_DOING[current] || 'выполняется'}`
+    : !connected
+      ? 'сначала подключитесь к MCP-серверу'
+      : pipe.status || 'ответ каждого шага уходит на вход следующему';
+  status.title = status.textContent;
+
+  const box = $('stages');
+  box.innerHTML = '';
+  pipe.steps.forEach((step, i) => {
+    if (i) {
+      const arrow = document.createElement('div');
+      arrow.className = 'arrow' + (step.check === true ? ' ok' : step.check === false ? ' bad'
+        : step.state === 'run' ? ' flow' : '');
+      arrow.textContent = '➜';
+      arrow.title = step.check === true ? 'данные дошли без изменений: отпечатки отправленного и полученного совпали'
+        : step.check === false ? 'данные изменились по дороге' : 'ответ предыдущего шага уходит на вход этому';
+      box.appendChild(arrow);
+    }
+    const card = document.createElement('div');
+    card.className = 'stage ' + step.state;
+    card.innerHTML = '<div class="stage-head"><span class="stage-title"></span><span class="stage-tool"></span></div>' +
+      '<div class="stage-text"></div><div class="stage-sub"></div>';
+    card.querySelector('.stage-title').textContent = `${STEP_NUMBERS[i]} ${step.title}`;
+    card.querySelector('.stage-tool').textContent = step.tool;
+    const text = card.querySelector('.stage-text');
+    text.textContent = STEP_ICONS[step.state] + step.text;
+    if (step.tool === 'save_to_file' && step.state === 'done' && pipe.file) {
+      const a = document.createElement('a');
+      a.href = `/api/reports/${encodeURIComponent(pipe.file)}`;
+      a.target = '_blank';
+      a.textContent = step.text;
+      text.replaceChildren('✓ ', a);
+    }
+    const sub = card.querySelector('.stage-sub');
+    if (step.state === 'run') sub.dataset.started = step.started; else sub.textContent = step.sub;
+    box.appendChild(card);
+  });
+}
+
+// --- отчёты, которые записал save_to_file: переписанный файл подсвечивается
+const seenReports = new Map();
+
+function renderReports(list) {
+  $('reports-pill').textContent = list.length ? `файлов ${list.length}` : '';
+  const box = $('reports');
+  box.innerHTML = '';
+  if (!list.length) {
+    box.innerHTML = '<div class="empty-row">пока пусто: запустите пайплайн слева</div>';
+  }
+  for (const r of list) {
+    const row = document.createElement('div');
+    row.className = 'watch';
+    if (seenReports.get(r.name) !== r.mtime) {
+      if (painted) row.classList.add('flash');
+      seenReports.set(r.name, r.mtime);
+    }
+    row.innerHTML = '<div class="watch-text"><div class="watch-repo"><a target="_blank"></a></div>' +
+      '<div class="watch-sub"></div></div><div class="watch-buttons"><button>Удалить</button></div>';
+    const a = row.querySelector('a');
+    a.href = `/api/reports/${encodeURIComponent(r.name)}`;
+    a.textContent = r.name;
+    row.querySelector('.watch-sub').textContent = `${(r.size / 1024).toFixed(1)} КБ · записан ${r.time}`;
+    row.querySelector('button').onclick = () => post(`/api/reports/${encodeURIComponent(r.name)}/delete`);
+    box.appendChild(row);
+  }
 }
 
 // --- автосводка агента: как часто, что было на прошлом круге, когда следующий
@@ -425,6 +557,9 @@ function tick() {
   status.textContent = status.dataset.base + (ts ? ` · следующая через ${countdown(ts)}` : '');
   for (const el of document.querySelectorAll('[data-next]')) {
     el.textContent = 'следующая проверка через ' + countdown(Number(el.dataset.next));
+  }
+  for (const el of document.querySelectorAll('[data-started]')) {
+    el.textContent = `идёт ${Math.max(0, Math.round(Date.now() / 1000 - Number(el.dataset.started)))} с`;
   }
 }
 
@@ -485,6 +620,12 @@ function renderWatch(watch) {
   }
 }
 
+const TOOL_GROUPS = {
+  live: 'по запросу — живой GitHub',
+  pipeline: 'пайплайн — поиск → сводка → файл',
+  schedule: 'по расписанию — наблюдение и сводка',
+};
+
 function renderServer(srv) {
   // --- выключатель сервера и то, откуда он берёт данные
   const power = $('server-toggle');
@@ -507,11 +648,11 @@ function renderServer(srv) {
   list.innerHTML = '';
   let group = null;
   for (const tool of srv.tools) {
-    if (tool.scheduled !== group) {
-      group = tool.scheduled;
+    if (tool.group !== group) {
+      group = tool.group;
       const head = document.createElement('div');
       head.className = 'label tool-group';
-      head.textContent = group ? 'по расписанию — наблюдение и сводка' : 'по запросу — живой GitHub';
+      head.textContent = TOOL_GROUPS[group];
       list.appendChild(head);
     }
     const row = document.createElement('label');
@@ -613,34 +754,54 @@ function renderServer(srv) {
   }
 }
 
-// Модель отвечает лёгкой разметкой: жирное показываем жирным, остальное — как есть.
+// Модель отвечает лёгкой разметкой: жирное показываем жирным, `код` — моноширинным,
+// остальное — как есть.
 function markup(text) {
   const safe = text.replace(/[&<>]/g, (ch) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[ch]));
-  return safe.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+  return safe.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/`([^`\n]+)`/g, '<code>$1</code>');
 }
+
+// Сообщения, которые агент прислал сам, без вопроса в чате.
+const MESSAGE_HEADS = {
+  report: (m) => `📋 Сводка агента · ${m.time} — пришла сама, без вопроса`,
+  pipeline: (m) => `🔗 Пайплайн · ${m.time} — «${m.query}»: поиск → сводка → файл`,
+};
+
+let shownMessages = 0;   // сколько сообщений было на прошлой отрисовке
 
 function renderChat(messages) {
   const chat = $('chat');
   const atBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 60;
+  const scrolled = chat.scrollTop;
+  const grew = messages.length > shownMessages;
+  if (!pending) shownMessages = messages.length;   // ответ ещё в пути — новым он станет по приходу
   chat.innerHTML = '';
 
   if (!messages.length && !pending) {
     const hint = document.createElement('div');
     hint.className = 'empty-chat';
-    hint.textContent = 'Подключитесь к MCP-серверу и спросите про репозиторий. Агент ответит только тем, что достанет инструментами из GitHub.';
+    hint.innerHTML = '<p></p><div class="examples"></div>';
+    hint.querySelector('p').textContent = 'Подключитесь к MCP-серверу и спросите про репозиторий. Агент ответит только тем, что достанет инструментами из GitHub.';
+    for (const text of EXAMPLES) {
+      const chip = document.createElement('button');
+      chip.className = 'example';
+      chip.textContent = text;
+      chip.onclick = () => { $('input').value = text; $('input').focus(); };
+      hint.querySelector('.examples').appendChild(chip);
+    }
     chat.appendChild(hint);
   }
 
   for (const m of messages) {
     const wrap = document.createElement('div');
-    wrap.className = 'msg ' + (m.role === 'user' ? 'user' : 'bot') + (m.kind === 'report' ? ' report' : '');
+    wrap.className = 'msg ' + (m.role === 'user' ? 'user' : 'bot') + (MESSAGE_HEADS[m.kind] ? ' report' : '');
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
     bubble.innerHTML = markup(m.text);
-    if (m.kind === 'report') {
+    if (MESSAGE_HEADS[m.kind]) {
       const head = document.createElement('div');
       head.className = 'report-head';
-      head.textContent = `📋 Сводка агента · ${m.time} — пришла сама, без вопроса`;
+      head.textContent = MESSAGE_HEADS[m.kind](m);
       bubble.prepend(head);
     }
     wrap.appendChild(bubble);
@@ -669,7 +830,16 @@ function renderChat(messages) {
     wrap.innerHTML = '<div class="bubble">Агент думает…</div>';
     chat.appendChild(wrap);
   }
-  if (atBottom || pending) chat.scrollTop = chat.scrollHeight;
+  // Пришло новое сообщение выше окна чата — показываем его с начала, а не с хвоста.
+  // Иначе оставляем прокрутку как была: перерисовка не должна дёргать чат.
+  const last = chat.lastElementChild;
+  if (!messages.length && !pending) {
+    chat.scrollTop = 0;
+  } else if ((grew || pending) && last) {
+    chat.scrollTop = last.offsetHeight > chat.clientHeight ? last.offsetTop - 16 : chat.scrollHeight;
+  } else {
+    chat.scrollTop = atBottom ? chat.scrollHeight : scrolled;
+  }
 }
 
 function renderLog(log) {
@@ -725,16 +895,27 @@ $('repo-refresh').onclick = () => post('/api/repo/refresh');
 $('auto-every').onchange = (e) => post('/api/report', {minutes: Number(e.target.value)});
 $('auto-now').onclick = () => post('/api/report/now');
 
-for (const text of EXAMPLES) {
-  const chip = document.createElement('button');
-  chip.className = 'example';
-  chip.textContent = text;
-  chip.onclick = () => { $('input').value = text; $('input').focus(); };
-  $('examples').appendChild(chip);
+async function runPipeline() {
+  const text = $('pipe-query').value.trim();
+  if (!text) { $('pipe-query').focus(); return; }
+  await post('/api/pipeline', {text});
+}
+$('pipe-run').onclick = runPipeline;
+$('pipe-query').onkeydown = (e) => {
+  if (e.key === 'Enter' && !$('pipe-run').disabled) { e.preventDefault(); runPipeline(); }
+};
+
+// Пока идёт пайплайн, состояние спрашиваем чаще — шаги загораются без запаздывания.
+async function poll() {
+  try {
+    await refresh(false);
+  } catch (e) {
+    // приложение перезапускается — спросим ещё раз на следующем круге
+  }
+  setTimeout(poll, fast ? 300 : 1200);
 }
 
-refresh(true);
-setInterval(() => refresh(false), 1200);
+poll();
 setInterval(tick, 1000);
 </script>
 </body>

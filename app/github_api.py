@@ -14,9 +14,11 @@
 """
 import asyncio
 import base64
+import re
 import shutil
 import subprocess
 from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Any
 
 import httpx
@@ -336,6 +338,108 @@ async def read_file(path: str, repo: str | None = None, ref: str | None = None,
         "обрезан": cut,
         "содержимое": text[:max_chars] + ("\n… файл обрезан" if cut else ""),
     }
+
+
+# --- поиск по коду: первый шаг пайплайна ------------------------------------
+
+# Двоичные файлы не читаем: текста в них нет, а запрос к API тратится.
+BINARY = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".pdf", ".zip", ".gz",
+          ".exe", ".dll", ".pyc", ".db", ".sqlite", ".woff", ".woff2", ".ttf", ".mp3", ".mp4"}
+
+# Объявление функции или класса — в Python и в JavaScript.
+_SCOPE = re.compile(r"^(\s*)(?:async\s+)?(?:def|class|function)\s+(\w+)")
+
+# Содержимое по хешу не меняется, поэтому прочитанное помним: повторный поиск
+# по тому же репозиторию стоит один запрос (дерево файлов) вместо десятка.
+_blobs: dict[str, str | None] = {}
+
+
+async def _blob_text(name: str, sha: str, limit: asyncio.Semaphore) -> str | None:
+    """Текст файла по его хешу; None — файл двоичный."""
+    if sha not in _blobs:
+        async with limit:
+            data = await get("/repos/{0}/git/blobs/{1}".format(name, sha))
+        if len(_blobs) > 2000:
+            _blobs.clear()
+        try:
+            _blobs[sha] = base64.b64decode(data.get("content") or "").decode("utf-8")
+        except UnicodeDecodeError:
+            _blobs[sha] = None
+    return _blobs[sha]
+
+
+def _grep(text: str, needle: str) -> list[tuple[int, str, str]]:
+    """Строки с запросом без учёта регистра и где каждая стоит: функция или класс."""
+    low = needle.lower()
+    scope: list[tuple[int, str]] = []
+    found = []
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        # Строка вровень с объявлением или левее — объявление кончилось. Закрывающая
+        # скобка не в счёт: это хвост сигнатуры или конец тела того же объявления.
+        if stripped and stripped[0] not in ")]}":
+            indent = len(line) - len(line.lstrip())
+            while scope and scope[-1][0] >= indent:
+                scope.pop()
+        if low in line.lower():
+            found.append((number, stripped, ".".join(name for _, name in scope)))
+        head = _SCOPE.match(line)
+        if head:
+            scope.append((len(head.group(1)), head.group(2)))
+    return found
+
+
+async def search_code(query: str, repo: str | None = None, path: str = "",
+                      max_files: int = 60, max_matches: int = 60) -> dict:
+    """Все строки репозитория (или одной его папки), где встречается запрос.
+
+    Поиск самого GitHub (/search/code) не используем: у него отдельный лимит, а
+    свежие репозитории он индексирует с опозданием. Берём дерево файлов и читаем
+    их сами — так находится ровно то, что лежит в репозитории сейчас.
+    """
+    name = repo_name(repo)
+    needle = query.strip()
+    if len(needle) < 2:
+        raise GitHubError("запрос короче двух символов: так найдётся всё подряд")
+    folder = path.strip().strip("/")
+    tree = await get("/repos/{0}/git/trees/HEAD".format(name), recursive=1)
+    files = [
+        item for item in tree.get("tree") or []
+        if item.get("type") == "blob"
+        and (not folder or item["path"] == folder or item["path"].startswith(folder + "/"))
+        and 0 < (item.get("size") or 0) <= 300_000
+        and PurePosixPath(item["path"]).suffix.lower() not in BINARY
+    ]
+    if not files:
+        raise GitHubError("в «{0}» нет текстовых файлов для поиска".format(folder or name))
+    rest = len(files) - max_files
+    files = files[:max_files]
+
+    limit = asyncio.Semaphore(8)
+    texts = await asyncio.gather(*(_blob_text(name, item["sha"], limit) for item in files))
+
+    matches = []
+    for item, text in zip(files, texts):
+        for number, line, inside in _grep(text or "", needle):
+            row = {"файл": item["path"], "строка": number, "текст": line[:160]}
+            if inside:
+                row["внутри"] = inside
+            matches.append(row)
+
+    result = {
+        "запрос": needle,
+        "репозиторий": name,
+        "папка": folder or "весь репозиторий",
+        "просмотрено файлов": len(files),
+        "файлов с совпадениями": len({row["файл"] for row in matches}),
+        "совпадений": len(matches),
+        "совпадения": matches[:max_matches],
+    }
+    if len(matches) > max_matches:
+        result["показаны"] = "первые {0} из {1}".format(max_matches, len(matches))
+    if rest > 0:
+        result["не просмотрено"] = "ещё {0} файлов: сузьте поиск параметром path".format(rest)
+    return result
 
 
 # --- сводка для правой панели интерфейса ------------------------------------

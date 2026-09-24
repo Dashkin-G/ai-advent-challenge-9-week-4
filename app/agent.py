@@ -6,13 +6,15 @@
 попадает в журнал обмена — его видно в интерфейсе.
 
 Кроме ответов на вопросы агент умеет работать сам: `AutoReport` раз в N минут
-спрашивает у сервера сводку наблюдения и присылает её в чат.
+спрашивает у сервера сводку наблюдения и присылает её в чат, а `Pipeline`
+проводит цепочку из трёх инструментов «поиск → сводка → файл».
 """
 import asyncio
 import json
 import logging
 import time
 from datetime import datetime
+from pathlib import PurePosixPath
 
 from mcp import Client
 from openai import OpenAI
@@ -28,6 +30,7 @@ SYSTEM = (
     "Если нужен хеш коммита или путь к файлу, сначала возьми список, а потом "
     "запрашивай подробности. Опирайся на то, что вернули инструменты: хеши, "
     "даты, имена файлов, номера задач.\n"
+    "Где в коде встречается слово или имя — ищи инструментом search_code.\n"
     "Если просят следить за репозиторием или присылать сводку — заведи наблюдение "
     "инструментом watch_repo. На вопросы «что произошло за час / за день» отвечай "
     "по watch_summary."
@@ -110,7 +113,9 @@ class McpLink:
     async def _hold(self, ready: asyncio.Event) -> None:
         """Держать сессию открытой, пока не попросят закрыть."""
         try:
-            async with Client(self.url, read_timeout_seconds=30) as client:
+            # Тайм-аут с запасом: сводку в пайплайне пишет модель, и такой
+            # tools/call длится дольше обычного похода в GitHub.
+            async with Client(self.url, read_timeout_seconds=120) as client:
                 self._client = client
                 info = client.server_info
                 self.info = {
@@ -183,22 +188,29 @@ class McpLink:
         )
         return self.tools
 
-    async def call_tool(self, name: str, arguments: dict) -> str:
-        """Вызвать инструмент (tools/call) и вернуть результат текстом для модели."""
+    async def call(self, name: str, arguments: dict) -> tuple[object, bool]:
+        """Вызвать инструмент (tools/call): структурированный ответ и признак успеха."""
         if self._client is None:
             raise RuntimeError("соединение с MCP-сервером не установлено")
         result = await self._client.call_tool(name, arguments)
         payload = result.structured_content
         if payload is None:
             payload = "\n".join(getattr(c, "text", "") for c in result.content)
-        text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, default=str)
+        # В строке журнала — начало аргументов: в пайплайне они бывают большими,
+        # целиком они видны в раскрытой строке.
+        args = json.dumps(arguments, ensure_ascii=False)
         self.note(
             "tools/call",
-            "{0}({1})".format(name, json.dumps(arguments, ensure_ascii=False)),
+            "{0}({1})".format(name, args if len(args) <= 160 else args[:160] + "…"),
             {"инструмент": name, "аргументы": arguments, "результат": payload},
             ok=not result.is_error,
         )
-        return text
+        return payload, not result.is_error
+
+    async def call_tool(self, name: str, arguments: dict) -> str:
+        """Вызвать инструмент и вернуть результат текстом — так его читает модель."""
+        payload, _ = await self.call(name, arguments)
+        return payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, default=str)
 
     def snapshot(self) -> dict:
         return {
@@ -412,6 +424,187 @@ class AutoReport:
 report = AutoReport()
 
 
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    """Число со словом в нужной форме: 1 файл, 2 файла, 5 файлов."""
+    if n % 10 == 1 and n % 100 != 11:
+        word = one
+    elif 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        word = few
+    else:
+        word = many
+    return "{0} {1}".format(n, word)
+
+
+class Pipeline:
+    """Пайплайн из трёх инструментов MCP: поиск → сводка → файл.
+
+    Цепочку ведёт код агента, а не модель: каждый шаг — отдельный tools/call по
+    протоколу, и ответ шага уходит на вход следующему. Сервер на каждом шаге
+    сообщает отпечаток того, что получил; совпал с отпечатком отправленного —
+    данные дошли без потерь, не совпал — цепочка останавливается.
+    """
+
+    # Инструмент, название шага, что он сделает и что берёт → что отдаёт.
+    STEPS = (
+        ("search_code", "Поиск", "найдёт строки в коде", "запрос → совпадения"),
+        ("summarize", "Сводка", "модель опишет найденное", "совпадения → отчёт"),
+        ("save_to_file", "Файл", "отчёт ляжет на диск", "отчёт → файл .md"),
+    )
+
+    def __init__(self) -> None:
+        self.query = ""
+        self.running = False
+        self.status = ""                # итог прошлого прогона одной строкой
+        self.file: str | None = None    # имя сохранённого отчёта
+        self.steps = self._fresh()
+        self._task: asyncio.Task | None = None
+
+    def _fresh(self) -> list[dict]:
+        return [{"tool": tool, "title": title, "state": "idle", "text": hint, "sub": flow,
+                 "check": None, "started": None, "seconds": None}
+                for tool, title, hint, flow in self.STEPS]
+
+    def start(self, query: str) -> None:
+        """Запустить цепочку фоном: интерфейс видит, как шаги проходят по очереди."""
+        if self.running:
+            raise RuntimeError("пайплайн уже выполняется")
+        if not link.connected:
+            raise RuntimeError("нет соединения с MCP-сервером — нажмите «Подключиться»")
+        self.query, self.running, self.status, self.file = query, True, "", None
+        self.steps = self._fresh()
+        _touch()
+        self._task = asyncio.create_task(self._run())
+
+    def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+
+    def _set(self, index: int, **fields) -> None:
+        self.steps[index].update(fields)
+        _touch()
+
+    def _stop(self, index: int, reason: str) -> None:
+        """Шаг не удался: следующие не выполняются, причина — в карточке шага."""
+        reason = reason if len(reason) <= 160 else reason[:160] + "…"
+        self._set(index, state="error", text=reason)
+        for step in self.steps[index + 1:]:
+            step.update(state="skip", text="не выполнялся")
+        self.status = "остановлен на шаге {0}".format(index + 1)
+
+    async def _call(self, index: int, arguments: dict) -> dict | None:
+        """Один шаг — один tools/call. None — шаг не удался и цепочка встала."""
+        tool = self.steps[index]["tool"]
+        self._set(index, state="run", text="выполняется…", started=time.time())
+        if not link.connected:
+            self._stop(index, "нет соединения с MCP-сервером")
+            return None
+        if tool not in {t["name"] for t in link.tools}:
+            self._stop(index, "инструмент {0} выключен на сервере".format(tool))
+            return None
+        started = time.perf_counter()
+        try:
+            payload, ok = await link.call(tool, arguments)
+        except Exception as e:
+            self._stop(index, _reason(e))
+            return None
+        self.steps[index]["seconds"] = round(time.perf_counter() - started, 1)
+        if not isinstance(payload, dict):  # ошибку валидации сервер присылает текстом
+            self._stop(index, str(payload) or "сервер вернул ошибку")
+            return None
+        if not ok or "ошибка" in payload:
+            self._stop(index, str(payload.get("ошибка") or "сервер вернул ошибку"))
+            return None
+        return payload
+
+    async def _run(self) -> None:
+        at = datetime.now().strftime("%H:%M")
+        try:
+            await self._chain(at)
+        except Exception as e:  # ответ неожиданной формы — не роняем задачу молча
+            logger.exception("Сбой пайплайна")
+            index = next((i for i, s in enumerate(self.steps) if s["state"] == "run"), 0)
+            self._stop(index, "{0}: {1}".format(type(e).__name__, e))
+        finally:
+            self.running = False
+            self.status = "{0} — {1}".format(at, self.status)
+            _touch()
+
+    async def _chain(self, at: str) -> None:
+        started = time.perf_counter()
+
+        # ① Поиск: первый инструмент получает данные — строки кода из GitHub.
+        found = await self._call(0, {"query": self.query})
+        if found is None:
+            return
+        count = found["совпадений"]
+        self._set(0, state="done",
+                  text="{0} в {1}".format(
+                      _plural(count, "совпадение", "совпадения", "совпадений"),
+                      _plural(found["файлов с совпадениями"], "файле", "файлах", "файлах"))
+                  if count else "совпадений нет",
+                  sub="просмотрено файлов: {0} · {1} с".format(
+                      found["просмотрено файлов"], self.steps[0]["seconds"]))
+        if not count:
+            for step in self.steps[1:]:
+                step.update(state="skip", text="сводить нечего")
+            self.status = "«{0}» в коде не встречается".format(self.query)
+            return
+
+        # ② Сводка: второй обрабатывает — получает ответ поиска целиком.
+        summary = await self._call(1, {"found": found})
+        if summary is None:
+            return
+        got = summary["получено"]
+        if got["отпечаток"] != found["отпечаток"]:
+            self._set(1, check=False)
+            self._stop(1, "данные изменились по дороге: отправлено {0}, получено {1}".format(
+                found["отпечаток"], got["отпечаток"]))
+            return
+        self._set(1, state="done", check=True, text="сводка готова",
+                  sub="получено {0} из {1} ✓ · {2} с".format(
+                      got["совпадений"], len(found["совпадения"]), self.steps[1]["seconds"]))
+
+        # ③ Файл: третий сохраняет — получает отчёт, который собрала сводка.
+        saved = await self._call(2, {"name": self.query, "content": summary["отчёт"]})
+        if saved is None:
+            return
+        got = saved["получено"]
+        if got["отпечаток"] != summary["отпечаток"]:
+            self._set(2, check=False)
+            self._stop(2, "данные изменились по дороге: отправлено {0}, получено {1}".format(
+                summary["отпечаток"], got["отпечаток"]))
+            return
+        self.file = PurePosixPath(saved["файл"]).name
+        self._set(2, state="done", check=True, text=self.file,
+                  sub="получено {0:.1f} КБ ✓ · {1} с".format(saved["байт"] / 1024, self.steps[2]["seconds"]))
+
+        seconds = round(time.perf_counter() - started, 1)
+        self.status = "готово за {0} с, сводка пришла в чат".format(seconds)
+        history.append({
+            "role": "assistant",
+            "kind": "pipeline",
+            "time": at,
+            "query": self.query,
+            "text": "{0}\n\nОтчёт сохранён: {1}".format(summary["сводка"], saved["файл"]),
+            "calls": [
+                {"name": "search_code", "arguments": {"query": self.query}, "ok": True},
+                {"name": "summarize", "arguments": {"found": "ответ search_code целиком"}, "ok": True},
+                {"name": "save_to_file", "arguments": {"name": self.query, "content": "поле «отчёт»"},
+                 "ok": True},
+            ],
+            "tokens": summary["токенов"],
+            "seconds": seconds,
+        })
+
+    def snapshot(self) -> dict:
+        return {"query": self.query, "running": self.running, "status": self.status,
+                "file": self.file, "steps": self.steps}
+
+
+pipeline = Pipeline()
+
+
 def clear_history() -> None:
     history.clear()
     _touch()
@@ -419,4 +612,4 @@ def clear_history() -> None:
 
 def snapshot() -> dict:
     return {"revision": revision, "messages": history, "mcp": link.snapshot(),
-            "model": config.MODEL, "report": report.snapshot()}
+            "model": config.MODEL, "report": report.snapshot(), "pipeline": pipeline.snapshot()}
