@@ -1,23 +1,27 @@
-"""MCP-сервер вокруг GitHub REST API.
+"""MCP-серверы проекта: GitHub и зависимости Python.
 
-Это первая половина проекта. Сервер поднимается внутри того же процесса, что и
-чат (см. `main.py`), но общается с агентом по протоколу MCP — транспорт
-streamable HTTP на `/mcp`. Данные он не придумывает: шесть инструментов делают
-живой запрос к api.github.com (см. `github_api.py`), три складываются в
-пайплайн «поиск → сводка → файл» (см. `reports.py`), а три инструмента
-наблюдения заводят задание по расписанию и отдают накопленную в SQLite сводку
-(см. `watcher.py`).
+Это первая половина проекта. Оба сервера поднимаются внутри того же процесса,
+что и чат (см. `main.py`), но общаются с агентом по протоколу MCP — транспорт
+streamable HTTP, у каждого свой адрес: /mcp/github/ и /mcp/deps/. Для агента
+это два разных сервера: своя сессия, своё имя и свой список инструментов.
+
+* **github** — репозиторий. Шесть инструментов делают живой запрос к
+  api.github.com (см. `github_api.py`), три складываются в пайплайн «поиск →
+  сводка → файл» (см. `reports.py`), а три инструмента наблюдения заводят
+  задание по расписанию и отдают накопленную в SQLite сводку (см. `watcher.py`).
+* **deps** — пакеты Python: последняя версия на PyPI и известные уязвимости из
+  базы OSV.dev (см. `deps_api.py`).
 
 Что здесь происходит по пунктам задания:
 
-* **регистрация инструмента** — `mcp.add_tool(...)` в цикле по `TOOL_SPECS`;
+* **регистрация инструмента** — `mcp.add_tool(...)` в конструкторе `Server`;
 * **описание входных параметров** — аннотации `Annotated[..., Field(...)]` у
   функций: из них SDK сам собирает JSON-схему, которая уезжает агенту в ответе
   `tools/list` и дальше модели;
 * **возврат результата** — функции отдают обычный словарь, SDK превращает его
   в структурированный ответ `tools/call`.
 
-Сервер можно выключить целиком и можно выключить любой отдельный инструмент —
+Любой сервер можно выключить целиком и можно выключить любой его инструмент —
 тогда агент перестаёт его видеть в ответе `tools/list`.
 """
 import inspect
@@ -28,17 +32,13 @@ from typing import Annotated, Any, Literal
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
-from . import config
+from . import config, deps_api
 from . import github_api as gh
 from . import reports, watcher
 
-# Номер состояния: растёт на каждое изменение настроек сервера или панели.
+# Номер состояния: растёт на каждое изменение настроек серверов или панели.
 # По нему интерфейс понимает, что пора перерисовать правую половину.
 revision = 0
-
-# Выключатель всего сервера. Проверяется в `main.py` перед тем, как пустить
-# запрос на /mcp: выключенный сервер отвечает 503, и агент честно теряет связь.
-server_on = True
 
 # Сводка по репозиторию для правой панели. Обновляется при старте и по кнопке:
 # панель не должна ходить в GitHub на каждый опрос состояния.
@@ -46,6 +46,10 @@ overview: dict | None = None
 overview_error: str | None = None
 overview_time: str | None = None
 overview_loading = False
+
+# Что сервер «Зависимости» уже проверил — тоже для правой панели: строка на
+# пакет, свежий ответ поверх прошлого. Живёт в памяти процесса.
+packages: dict[str, dict[str, Any]] = {}
 
 
 def _touch() -> None:
@@ -72,7 +76,7 @@ async def refresh_overview() -> str | None:
     return overview_error
 
 
-# --- Инструменты, которые сервер отдаёт агенту -------------------------------
+# --- Инструменты сервера GitHub ----------------------------------------------
 # Каждый параметр описан прямо в аннотации: это описание уходит в JSON-схему,
 # а оттуда — модели, поэтому пишем так, будто объясняем человеку. Возвращаем
 # простые словари: они уедут к модели как JSON, и русские ключи читаются ею
@@ -188,7 +192,8 @@ async def tool_save_to_file(
                     "data/reports/<имя>.md; то же имя перезапишет прошлый отчёт.")],
     content: Annotated[str, Field(
         min_length=1, max_length=200_000,
-        description="Что сохранить: обычно поле «отчёт» из ответа summarize.")],
+        description="Что сохранить, в Markdown: поле «отчёт» из ответа summarize "
+                    "или отчёт, который ты собрал сам.")],
 ) -> dict[str, Any]:
     try:
         return reports.save(name, content)
@@ -238,118 +243,165 @@ async def tool_stop_watch(
     return {"ошибка": "наблюдения №{0} нет".format(watch_id)}
 
 
-# Имя → функция и описание. Описание уходит модели как есть, поэтому в нём
-# сразу сказано, что инструмент делает и когда его звать.
-TOOL_SPECS: dict[str, tuple[Callable[..., Any], str]] = {
+# Имя → функция, описание и группа в правой панели. Описание уходит модели как
+# есть, поэтому в нём сразу сказано, что инструмент делает и когда его звать.
+GITHUB_TOOLS: dict[str, tuple[Callable[..., Any], str, str]] = {
     "repo_info": (
         tool_repo_info,
         "Карточка репозитория на GitHub: описание, основной язык, ветка по "
         "умолчанию, число звёзд и открытых задач, время последней записи.",
+        "live",
     ),
     "list_commits": (
         tool_list_commits,
         "Последние коммиты репозитория: короткий хеш, автор, дата и первая "
         "строка сообщения. С этого инструмента начинают, когда спрашивают, "
         "что нового или что менялось.",
+        "live",
     ),
     "commit_details": (
         tool_commit_details,
         "Подробности одного коммита по его хешу: полное сообщение, список "
         "изменённых файлов, сколько строк добавлено и удалено, куски диффа.",
+        "live",
     ),
     "list_issues": (
         tool_list_issues,
         "Задачи (issues) и pull request'ы репозитория с их номером, "
         "заголовком, автором и состоянием.",
+        "live",
     ),
     "list_files": (
         tool_list_files,
         "Содержимое папки репозитория: файлы и вложенные папки с размерами. "
         "Нужен, чтобы найти путь к файлу перед чтением.",
+        "live",
     ),
     "read_file": (
         tool_read_file,
         "Текст файла из репозитория по его пути. Большие файлы обрезаются, "
         "двоичные не читаются.",
+        "live",
     ),
     "search_code": (
         tool_search_code,
         "Поиск по коду репозитория: все строки, где встречается слово или имя, с "
         "файлом, номером строки и функцией, внутри которой стоит строка. Первый "
         "шаг пайплайна: его ответ целиком передают в summarize.",
+        "pipeline",
     ),
     "summarize": (
         tool_summarize,
         "Сводка найденного: модель коротко описывает, что это и где используется, "
         "а инструмент собирает отчёт в Markdown. На вход — ответ search_code "
         "целиком; поле «отчёт» из ответа передают в save_to_file.",
+        "pipeline",
     ),
     "save_to_file": (
         tool_save_to_file,
-        "Сохранить текст в файл data/reports/<имя>.md на сервере. Последний шаг "
-        "пайплайна: сохраняет отчёт, который собрал summarize.",
+        "Сохранить отчёт в Markdown в файл data/reports/<имя>.md на сервере: "
+        "последний шаг пайплайна или любой отчёт, собранный по ходу работы.",
+        "pipeline",
     ),
     "watch_repo": (
         tool_watch_repo,
         "Поставить репозиторий на наблюдение по расписанию: сервер будет сам "
         "проверять его каждые N минут и записывать новые коммиты, задачи и "
         "звёзды. Повторный вызов для того же репозитория меняет интервал.",
+        "schedule",
     ),
     "watch_summary": (
         tool_watch_summary,
         "Агрегированная сводка наблюдения за период: сколько было проверок, "
         "какие коммиты появились и от кого, какие задачи открыты и закрыты, "
         "как изменились звёзды. Отвечай по ней на «что произошло за час / день».",
+        "schedule",
     ),
     "stop_watch": (
         tool_stop_watch,
         "Остановить наблюдение и удалить его историю. Номер наблюдения — из "
         "ответа watch_repo или watch_summary.",
+        "schedule",
     ),
 }
 
-# Группы инструментов в правой панели: пайплайн и расписание — отдельно от
-# обычных запросов к GitHub.
-PIPELINE = {"search_code", "summarize", "save_to_file"}
-SCHEDULED = {"watch_repo", "watch_summary", "stop_watch"}
 
-mcp = MCPServer(
-    name="github",
-    version="1.0",
-    instructions="Репозиторий на GitHub: коммиты, файлы и задачи. Данные "
-                 "берутся из api.github.com в момент вызова инструмента. "
-                 "Пайплайн search_code → summarize → save_to_file ищет по коду, "
-                 "сводит найденное и сохраняет отчёт в файл, а наблюдение по "
-                 "расписанию копит события и отдаёт сводку.",
-)
+# --- Инструменты сервера «Зависимости»: PyPI и OSV.dev -----------------------
 
-# Какие инструменты сейчас включены. Выключенный снимается с сервера целиком,
-# поэтому в ответе tools/list его нет — агент о нём даже не знает.
-enabled: dict[str, bool] = {name: True for name in TOOL_SPECS}
-for _name, (_fn, _description) in TOOL_SPECS.items():
-    mcp.add_tool(_fn, name=_name, description=_description)
+PackageArg = Annotated[str, Field(
+    min_length=1, max_length=120,
+    description="Имя пакета на PyPI, например fastapi или python-dotenv. Можно "
+                "строку из requirements.txt целиком: extras и условие на версию "
+                "отрежутся — uvicorn[standard]>=0.30.")]
 
 
-def set_tool(name: str, on: bool) -> None:
-    """Включить или выключить инструмент на сервере."""
-    if name not in TOOL_SPECS or enabled[name] == on:
-        return
-    if on:
-        fn, description = TOOL_SPECS[name]
-        mcp.add_tool(fn, name=name, description=description)
-    else:
-        mcp.remove_tool(name)
-    enabled[name] = on
+def _remember(name: str, **fields: Any) -> None:
+    """Запомнить ответ по пакету для правой панели."""
+    row = packages.setdefault(deps_api.canonical(name), {
+        "name": name, "checked": None, "checked_date": None, "newer": None,
+        "latest": None, "latest_date": None, "vulns": None, "found": [],
+    })
+    row.update(fields, time=datetime.now().strftime("%H:%M:%S"))
     _touch()
 
 
-def set_server(on: bool) -> None:
-    """Включить или выключить весь MCP-сервер."""
-    global server_on
-    if server_on != on:
-        server_on = on
-        _touch()
+async def tool_package_info(
+    name: PackageArg,
+    version: Annotated[str | None, Field(
+        description="С какой версией сравнить, например 0.115 — нижняя граница из "
+                    "requirements.txt. Тогда в ответе будет, когда она вышла и "
+                    "сколько выпусков новее. Можно не указывать.")] = None,
+) -> dict[str, Any]:
+    try:
+        info = await deps_api.package_info(name, version)
+    except deps_api.DepsError as e:
+        return {"ошибка": str(e)}
+    fields = {"latest": info["последняя версия"], "latest_date": info["вышла"]}
+    checked = info.get("проверенная версия")
+    if checked and "ошибка" not in checked:
+        fields.update(checked=checked["номер"], checked_date=checked["вышла"],
+                      newer=checked["выпусков новее"])
+    _remember(info["пакет"], **fields)
+    return info
 
+
+async def tool_vulnerabilities(
+    name: PackageArg,
+    version: Annotated[str, Field(
+        min_length=1, max_length=40,
+        description="Какую версию проверить, например 0.115 или 1.0.0. Для строки из "
+                    "requirements.txt вида пакет>=X — это X: нижняя граница, "
+                    "которую допускает проект.")],
+) -> dict[str, Any]:
+    try:
+        found = await deps_api.vulnerabilities(name, version)
+    except deps_api.DepsError as e:
+        return {"ошибка": str(e)}
+    _remember(found["пакет"], checked=found["версия"], vulns=found["уязвимостей"],
+              found=[{"id": v["номер"], "severity": v["опасность"], "fixed": v["исправлено в"]}
+                     for v in found["список"]])
+    return found
+
+
+DEPS_TOOLS: dict[str, tuple[Callable[..., Any], str, str]] = {
+    "package_info": (
+        tool_package_info,
+        "Пакет Python на PyPI: последняя версия и когда вышла, описание, лицензия, "
+        "нужная версия Python. С параметром version — ещё когда вышла эта версия "
+        "и сколько выпусков новее: так видно, насколько устарела зависимость.",
+        "packages",
+    ),
+    "vulnerabilities": (
+        tool_vulnerabilities,
+        "Известные уязвимости конкретной версии пакета Python по базе OSV.dev: "
+        "номер (CVE или GHSA), суть, опасность и версия, где исправлено. Одна "
+        "уязвимость под разными номерами считается один раз.",
+        "packages",
+    ),
+}
+
+
+# --- Сами серверы --------------------------------------------------------------
 
 def _params(fn: Callable[..., Any]) -> list[dict]:
     """Параметры инструмента для правой панели: имя и обязателен ли он."""
@@ -359,22 +411,102 @@ def _params(fn: Callable[..., Any]) -> list[dict]:
     ]
 
 
+class Server:
+    """Один MCP-сервер со своим адресом и выключателями: целиком и по инструменту."""
+
+    def __init__(self, key: str, title: str, source: str, instructions: str,
+                 tools: dict[str, tuple[Callable[..., Any], str, str]]) -> None:
+        self.key = key          # имя в протоколе; у агента — приставка к инструментам
+        self.title = title      # как сервер называется на экране
+        self.source = source    # откуда берёт данные — строка для правой панели
+        self.path = "{0}/{1}".format(config.MCP_PATH, key)
+        self.url = "{0}/{1}/".format(config.MCP_BASE_URL, key)
+        self.tools = tools
+        # Выключатель всего сервера. Проверяется в `main.py` перед тем, как пустить
+        # запрос на его адрес: выключенный отвечает 503, и агент честно теряет связь.
+        self.on = True
+        # Выключенный инструмент снимается с сервера целиком, поэтому в ответе
+        # tools/list его нет — агент о нём даже не знает.
+        self.enabled = {name: True for name in tools}
+        self.mcp = MCPServer(name=key, version="1.0", instructions=instructions)
+        for name, (fn, description, _group) in tools.items():
+            self.mcp.add_tool(fn, name=name, description=description)
+        # Приложение сервера — свой ASGI-роут, `main.py` подвешивает его к общему
+        # порту. Менеджер сессий у сервера появляется только после этого вызова.
+        self.app = self.mcp.streamable_http_app(streamable_http_path="/")
+
+    def set_tool(self, name: str, on: bool) -> None:
+        """Включить или выключить инструмент на сервере."""
+        if name not in self.tools or self.enabled[name] == on:
+            return
+        if on:
+            fn, description, _group = self.tools[name]
+            self.mcp.add_tool(fn, name=name, description=description)
+        else:
+            self.mcp.remove_tool(name)
+        self.enabled[name] = on
+        _touch()
+
+    def set_on(self, on: bool) -> None:
+        """Включить или выключить весь сервер."""
+        if self.on != on:
+            self.on = on
+            _touch()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "title": self.title,
+            "source": self.source,
+            "url": self.url,
+            "on": self.on,
+            "tools": [
+                {"name": name, "description": description, "on": self.enabled[name],
+                 "params": _params(fn), "group": group}
+                for name, (fn, description, group) in self.tools.items()
+            ],
+        }
+
+
+github = Server(
+    "github", "GitHub", config.GITHUB_API,
+    instructions="Репозиторий на GitHub: коммиты, файлы, задачи и поиск по коду. "
+                 "Данные берутся из api.github.com в момент вызова. Пайплайн "
+                 "search_code → summarize → save_to_file ищет по коду, сводит "
+                 "найденное и сохраняет отчёт в файл; save_to_file сохраняет и "
+                 "любой другой отчёт. Наблюдение по расписанию копит события и "
+                 "отдаёт сводку.",
+    tools=GITHUB_TOOLS,
+)
+deps = Server(
+    "deps", "Зависимости", "pypi.org и osv.dev · ключ не нужен",
+    instructions="Пакеты Python: последняя версия и даты выпусков на PyPI, "
+                 "известные уязвимости конкретной версии по базе OSV.dev. Данные "
+                 "берутся в момент вызова. Список пакетов проекта сервер не знает — "
+                 "его дают снаружи.",
+    tools=DEPS_TOOLS,
+)
+
+# Все серверы по имени: main.py монтирует каждый на свой адрес.
+SERVERS: dict[str, Server] = {server.key: server for server in (github, deps)}
+
+
+def clear_packages() -> None:
+    """Очистить карточку проверенных пакетов."""
+    packages.clear()
+    _touch()
+
+
 def snapshot() -> dict[str, Any]:
-    """Состояние сервера для правой панели интерфейса."""
+    """Состояние серверов для правой панели интерфейса."""
     return {
         "revision": revision,
-        "server_on": server_on,
+        "servers": [server.snapshot() for server in SERVERS.values()],
         "repo": config.GITHUB_REPO,
-        "api": config.GITHUB_API,
         "auth": gh.auth_state(),
         "overview": overview,
         "error": overview_error,
         "updated": overview_time,
         "loading": overview_loading,
-        "tools": [
-            {"name": name, "description": description, "on": enabled[name],
-             "params": _params(fn),
-             "group": "pipeline" if name in PIPELINE else "schedule" if name in SCHEDULED else "live"}
-            for name, (fn, description) in TOOL_SPECS.items()
-        ],
+        "packages": list(packages.values()),
     }

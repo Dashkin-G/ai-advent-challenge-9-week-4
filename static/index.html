@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>GitHub по MCP — агент и сервер</title>
+<title>MCP-серверы и агент</title>
 <style>
   :root {
     /* Не тёмная и не белая: приглушённый шалфейно-оливковый день. Светлота
@@ -19,6 +19,9 @@
     --run: #92a9c4; --run-line: #2a4a6f;
     --done: #d4a87d; --done-line: #764419;
     --fail: #d1aba9;
+    /* Плашки серверов: у каждого свой цвет — по нему видно, куда ушёл вызов.
+       Текст на них 10,7:1 и 8,1:1, сами плашки на фонах темы — не ниже 3,2:1. */
+    --srv-github: #3d2f63; --srv-deps: #0f5257; --srv-unknown: #4f5646; --srv-text: #f6f3fb;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
@@ -55,22 +58,42 @@
   ::placeholder { color: var(--muted); opacity: .85; }
   a { color: var(--accent); text-underline-offset: 3px; }
 
+  /* Плашка сервера: одна и та же в соединениях, маршруте, журнале и правой панели. */
+  .srv {
+    display: inline-block; border-radius: 7px; padding: 0 9px; font-size: 16.5px; font-weight: 650;
+    line-height: 1.5; white-space: nowrap; color: var(--srv-text); background: var(--srv-unknown);
+  }
+  .srv.github { background: var(--srv-github); }
+  .srv.deps { background: var(--srv-deps); }
+
   /* ---------- левая половина: агент ---------- */
   .conn { padding: 16px 22px; border-bottom: 1px solid var(--line); background: var(--panel); }
   .conn-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
   .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--bad); flex: none; box-shadow: 0 0 0 4px rgba(116,38,32,.25); }
   .dot.on { background: var(--ok); box-shadow: 0 0 0 4px rgba(36,70,42,.28); }
+  .dot.half { background: var(--warn); box-shadow: 0 0 0 4px rgba(74,51,6,.28); }
   .conn-text { flex: 1; min-width: 260px; }
   .conn-title { font-size: 23px; font-weight: 640; }
-  .conn-sub { color: var(--muted); font-size: 18.5px; margin-top: 3px; }
   .conn-buttons { display: flex; gap: 8px; }
 
-  .tools-block { margin-top: 16px; }
+  /* Строка на каждый сервер из реестра: как соединение, что сервер о себе сказал. */
+  .links { margin-top: 10px; display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: 5px 10px; align-items: center; }
+  .links .dot { width: 10px; height: 10px; box-shadow: none; margin-left: 1px; }
+  .link-sub { color: var(--muted); font-size: 18.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .link-sub.bad { color: var(--bad); font-weight: 500; }
+
+  .tools-block { margin-top: 12px; }
   .label { color: var(--muted); font-size: 15.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; }
-  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .tools-toggle { cursor: pointer; user-select: none; }
+  .tools-toggle::before { content: '▸  '; }
+  .tools-toggle.open::before { content: '▾  '; }
+  .tools-toggle.none { cursor: default; }
+  .tools-toggle.none::before { content: none; }
+  .tools-toggle .more { text-transform: none; letter-spacing: 0; font-weight: 500; font-size: 17px; }
+  .tool-server { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
   .chip {
     background: var(--field); border: 1px solid var(--line); border-radius: 999px;
-    padding: 7px 14px; font-size: 18px; font-family: ui-monospace, Consolas, monospace;
+    padding: 5px 13px; font-size: 18px; font-family: ui-monospace, Consolas, monospace;
   }
   .chip.empty { font-family: inherit; color: var(--muted); }
 
@@ -81,13 +104,15 @@
   .auto-sub { color: var(--muted); font-size: 17.5px; }
   .autobar select { font-size: 19px; padding: 8px 10px; }
 
-  /* Пайплайн: три шага в ряд, между ними стрелка — ответ шага уходит дальше. */
+  /* Пайплайн: три шага в ряд, между ними стрелка — ответ шага уходит дальше.
+     Пока пайплайн не запускали, карточки шагов спрятаны: место отдаём чату. */
   .pipe { padding: 12px 22px 14px; border-bottom: 1px solid var(--line); background: var(--panel); }
   .pipe-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .pipe-head input { width: 280px; font-size: 19px; padding: 8px 12px; }
   #pipe-run { min-width: 140px; }
   #pipe-status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .stages { display: flex; align-items: stretch; gap: 6px; margin-top: 10px; }
+  .stages[hidden] { display: none; }
   .stage {
     flex: 1 1 0; min-width: 0; padding: 7px 12px 8px; border-radius: 10px;
     background: var(--field); border: 2px dashed var(--line); line-height: 1.35;
@@ -120,11 +145,32 @@
   .msg.report .bubble { border-left: 6px solid var(--accent); }
   .bubble code { font: .9em ui-monospace, Consolas, monospace; background: rgba(255,255,255,.2); border-radius: 5px; padding: 0 4px; }
   .report-head { font-weight: 680; color: var(--accent); margin-bottom: 4px; }
-  .msg .meta { color: var(--muted); font-size: 17.5px; display: flex; gap: 10px; flex-wrap: wrap; }
-  .meta .used { color: var(--ok); font-family: ui-monospace, Consolas, monospace; }
-  .meta .used.bad { color: var(--bad); }
-  .empty-chat { color: var(--muted); font-size: 20px; margin: auto; text-align: center; max-width: 780px; }
-  .empty-chat p { margin: 0 auto; max-width: 540px; }
+  .msg .meta { color: var(--muted); font-size: 17.5px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .empty-chat { color: var(--muted); font-size: 20px; margin: auto; text-align: center; max-width: 900px; }
+  .empty-chat p { margin: 0 auto; max-width: 560px; }
+
+  /* Маршрут обращения: какие вызовы, на каком сервере, в каком порядке. Вызовы
+     одного хода модели с одним инструментом — одной строкой «× N». */
+  .work { white-space: normal; min-width: min(640px, 100%); }
+  .work-head { font-weight: 640; }
+  .work-phase { color: var(--muted); margin-top: 6px; font-size: 18px; }
+  .route {
+    display: grid; grid-template-columns: auto auto auto minmax(0, 1fr) auto;
+    gap: 5px 12px; align-items: center; margin-top: 8px; font-size: 18px;
+  }
+  .route .n { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
+  .route .tool { font-family: ui-monospace, Consolas, monospace; white-space: nowrap; }
+  .route .args { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .route .st { white-space: nowrap; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .route .st.done { color: var(--ok); }
+  .route .st.run { color: var(--run-line); }
+  .route .st.error { color: var(--bad); }
+  .route-box { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 4px 14px 10px; }
+  .hops { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; cursor: pointer; }
+  .hops .arr { color: var(--muted); }
+  .hops .times { color: var(--text); font-weight: 600; }
+  .hops:hover .more { text-decoration: underline; }
+  .more { color: var(--accent); }
 
   /* Примеры вопросов живут в пустом чате: начался разговор — место отдаём сообщениям. */
   .examples { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 14px; }
@@ -150,6 +196,7 @@
   .log-line { border-top: 1px solid var(--line); padding: 8px 0; }
   .log-head { display: flex; gap: 12px; align-items: baseline; cursor: pointer; font-size: 18px; }
   .log-time { color: var(--muted); font-family: ui-monospace, Consolas, monospace; font-size: 17px; }
+  .log-head .srv { min-width: 80px; text-align: center; }
   .log-method { font-family: ui-monospace, Consolas, monospace; color: var(--accent); min-width: 132px; }
   .log-line.bad .log-method { color: var(--bad); }
   .log-sum { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -160,7 +207,7 @@
   }
   .log-line.open .log-detail { display: block; }
 
-  /* ---------- правая половина: репозиторий на GitHub ---------- */
+  /* ---------- правая половина: MCP-серверы и то, что за ними ---------- */
   .right-body { flex: 1; overflow-y: auto; padding: 18px 22px 24px; display: flex; flex-direction: column; gap: 16px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px;
           box-shadow: var(--shadow); }
@@ -177,8 +224,13 @@
   }
   .switch button.off { background: #b08a80; border-color: var(--bad); color: #3a100c; }
 
+  .server-row { display: flex; gap: 16px; align-items: flex-start; padding: 12px 0; border-top: 1px solid var(--line); }
+  .server-row:first-child { border-top: none; }
+  .server-text { flex: 1; min-width: 0; }
+  .server-name { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .server-name code { font-family: ui-monospace, Consolas, monospace; font-size: 17.5px; color: var(--muted); }
+
   .tool-row { display: flex; gap: 12px; align-items: flex-start; padding: 11px 0; border-top: 1px solid var(--line); }
-  .tool-row:first-of-type { border-top: none; }
   .tool-row input { width: 23px; height: 23px; margin-top: 3px; accent-color: var(--accent); flex: none; }
   .tool-name { font-family: ui-monospace, Consolas, monospace; font-size: 20px; }
   .tool-row.off .tool-name { color: var(--muted); text-decoration: line-through; }
@@ -190,8 +242,10 @@
   }
   .param.optional { color: var(--muted); border-style: dashed; }
 
-  .tool-group { margin-top: 14px; padding-top: 10px; border-top: 2px solid var(--line); }
-  .tool-group:first-child { margin-top: 0; padding-top: 0; border-top: none; }
+  .tool-server-head { display: flex; align-items: center; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 3px solid var(--line); }
+  .tool-server-head:first-child { margin-top: 4px; padding-top: 0; border-top: none; }
+  .tool-server-head .pill { margin-left: 0; }
+  .tool-group { margin-top: 10px; }
   .tool-group + .tool-row { border-top: none; }
 
   /* Строка задания наблюдения; так же выглядят и файлы отчётов. */
@@ -223,11 +277,16 @@
   .sha, .num-tag { font-family: ui-monospace, Consolas, monospace; font-size: 18px; color: var(--accent); flex: none; }
   .row-text { font-size: 19.5px; overflow: hidden; text-overflow: ellipsis; }
   .row-sub { color: var(--muted); font-size: 17.5px; margin-top: 2px; }
+  .row-sub.bad { color: var(--bad); font-weight: 500; }
   .empty-row { color: var(--muted); font-size: 18.5px; padding: 8px 0; }
+  .pkg-name { font-family: ui-monospace, Consolas, monospace; font-size: 19.5px; flex: 1; }
+  .pkg-flag { font-size: 18px; white-space: nowrap; color: var(--muted); }
+  .pkg-flag.ok { color: var(--ok); font-weight: 600; }
+  .pkg-flag.bad { color: var(--bad); font-weight: 650; }
   .flash { animation: flash 1.4s ease-out; }
   @keyframes flash { from { background: rgba(255,255,255,.45); } to { background: transparent; } }
 
-  .warn-line { color: var(--warn); font-size: 18.5px; font-weight: 500; margin-top: 10px; }
+  .warn-line { color: var(--warn); font-size: 18.5px; font-weight: 500; margin-top: 8px; }
   .error-line { color: var(--bad); font-size: 18.5px; font-weight: 500; margin-top: 10px; }
 
   @media (max-width: 1040px) {
@@ -239,11 +298,11 @@
 <body>
 <div class="app">
 
-  <!-- ========== слева: агент и его соединение с MCP ========== -->
+  <!-- ========== слева: агент и его соединения с MCP-серверами ========== -->
   <section class="pane left">
     <header class="pane-head">
       <h1>Агент по репозиторию</h1>
-      <div class="sub">чат с моделью <span id="model">—</span> · инструменты берёт с MCP-сервера</div>
+      <div class="sub">чат с моделью <span id="model">—</span> · инструменты берёт с MCP-серверов</div>
     </header>
 
     <div class="conn">
@@ -251,16 +310,16 @@
         <span class="dot" id="dot"></span>
         <div class="conn-text">
           <div class="conn-title" id="conn-title">Нет соединения</div>
-          <div class="conn-sub" id="conn-sub">нажмите «Подключиться»</div>
         </div>
         <div class="conn-buttons">
           <button class="primary" id="btn-connect">Подключиться</button>
-          <button id="btn-refresh" title="Запросить tools/list заново">Обновить список</button>
+          <button id="btn-refresh" title="Запросить tools/list у всех серверов заново">Обновить списки</button>
         </div>
       </div>
+      <div class="links" id="links"></div>
       <div class="tools-block">
-        <div class="label">Инструменты, полученные от сервера <span id="tools-count"></span></div>
-        <div class="chips" id="agent-tools"></div>
+        <div class="label tools-toggle" id="tools-toggle"></div>
+        <div id="agent-tools"></div>
       </div>
       <div class="error-line" id="conn-error" hidden></div>
     </div>
@@ -290,12 +349,12 @@
                title="Что искать в коде репозитория" />
         <button class="primary" id="pipe-run">Запустить</button>
       </div>
-      <div class="stages" id="stages"></div>
+      <div class="stages" id="stages" hidden></div>
     </div>
 
     <div class="chat" id="chat"></div>
     <div class="composer">
-      <textarea id="input" rows="2" placeholder="Например: что изменилось в последнем коммите?"></textarea>
+      <textarea id="input" rows="2" placeholder="Например: проверь зависимости проекта и сохрани отчёт"></textarea>
       <button class="primary" id="send">Отправить</button>
     </div>
 
@@ -305,37 +364,41 @@
     </details>
   </section>
 
-  <!-- ========== справа: сам MCP-сервер, он же обёртка вокруг GitHub ========== -->
+  <!-- ========== справа: сами MCP-серверы и то, что за ними ========== -->
   <section class="pane right">
     <header class="pane-head">
-      <h1>Репозиторий на GitHub — вокруг него MCP-сервер</h1>
+      <h1>MCP-серверы: GitHub и зависимости</h1>
       <div class="sub">здесь то же самое видит человек; агент — через инструменты, по протоколу</div>
     </header>
 
     <div class="right-body">
       <div class="card">
-        <div class="card-head">
-          <div>
-            <div class="card-title">MCP-сервер</div>
-            <div class="card-sub">адрес для клиентов: <code id="mcp-url">—</code></div>
-          </div>
-          <div class="switch"><button id="server-toggle">ВКЛ</button></div>
-        </div>
-        <div class="card-sub" id="api-line">источник данных: —</div>
-        <div class="warn-line" id="server-off-note" hidden>Сервер выключен: соединение агента закрыто, новые подключения получают 503.</div>
-        <div class="warn-line" id="anon-note" hidden>Токена нет: GitHub отвечает, но даёт 60 запросов в час. Свой ключ — в <code>GITHUB_TOKEN</code>.</div>
+        <div class="card-title">MCP-серверы<span class="pill" id="servers-pill"></span></div>
+        <div class="card-sub">у каждого свой адрес и своя сессия; выключенный отвечает отказом, и агент теряет его инструменты</div>
+        <div id="server-list" style="margin-top:6px"></div>
       </div>
 
       <div class="card">
-        <div class="card-title">Инструменты для агента<span class="pill" id="tools-pill"></span></div>
-        <div class="card-sub">то, что сервер отдаёт в ответе <code>tools/list</code>: имя, описание и входные параметры (пунктирные — необязательные). Снимите галочку — инструмент пропадёт и у агента.</div>
-        <div id="tool-list" style="margin-top:10px"></div>
+        <div class="card-head">
+          <div>
+            <div class="card-title">Проверенные пакеты<span class="pill" id="packages-pill"></span></div>
+            <div class="card-sub">то, что сервер «Зависимости» ответил агенту: версии — с PyPI, уязвимости — из OSV.dev</div>
+          </div>
+          <button id="packages-clear">Очистить</button>
+        </div>
+        <div class="rows" id="packages"></div>
       </div>
 
       <div class="card">
         <div class="card-title">Отчёты на диске<span class="pill" id="reports-pill"></span></div>
-        <div class="card-sub">их пишет инструмент <code>save_to_file</code> в папку <code>data/reports</code>; тот же запрос перезаписывает свой файл</div>
+        <div class="card-sub">их пишет инструмент <code>save_to_file</code> сервера GitHub в папку <code>data/reports</code>; то же имя перезаписывает свой файл</div>
         <div class="rows" id="reports"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Инструменты для агента<span class="pill" id="tools-pill"></span></div>
+        <div class="card-sub">то, что каждый сервер отдаёт в ответе <code>tools/list</code>: имя, описание и входные параметры (пунктирные — необязательные). Снимите галочку — инструмент пропадёт и у агента.</div>
+        <div id="tool-list" style="margin-top:10px"></div>
       </div>
 
       <div class="card">
@@ -378,21 +441,42 @@
 </div>
 
 <script>
+// Три вопроса — три маршрута: к обоим серверам, только к «Зависимостям», только к GitHub.
 const EXAMPLES = [
+  'Проверь зависимости проекта и сохрани отчёт',
+  'Какая последняя версия fastapi?',
   'Что изменилось в последнем коммите?',
-  'Из каких файлов состоит проект?',
-  'Загляни в README и расскажи, что это за проект',
 ];
 
 let revision = -1;       // номер состояния: перерисовываем только при изменении
+let lastState = null;    // последнее состояние — для перерисовки по щелчку
 let pending = false;     // ждём ответ агента
 let lastError = '';      // ошибка последнего действия
 const openLogs = new Set();   // раскрытые строки журнала переживают перерисовку
+const openRoutes = new Set(); // раскрытые маршруты под ответами — тоже
 const seenCommits = new Set(); // чтобы подсветить приехавший коммит
 let painted = false;          // первая отрисовка ничего не подсвечивает
-let fast = false;             // идёт пайплайн — опрашиваем чаще
+let fast = false;             // агент или пайплайн работают — опрашиваем чаще
+let toolsOpen = null;         // список инструментов слева: null — сам, по ходу разговора
+let titles = {};              // имя сервера → как он называется на экране
 
 const $ = (id) => document.getElementById(id);
+
+// Число со словом в нужной форме: 1 вызов, 2 вызова, 5 вызовов.
+function plural(n, one, few, many) {
+  const tail = n % 100;
+  const word = tail % 10 === 1 && tail !== 11 ? one
+    : tail % 10 >= 2 && tail % 10 <= 4 && (tail < 12 || tail > 14) ? few : many;
+  return `${n} ${word}`;
+}
+
+function srvTag(key) {
+  const tag = document.createElement('span');
+  tag.className = 'srv ' + key;
+  tag.textContent = titles[key] || key;
+  tag.title = `MCP-сервер ${key}`;
+  return tag;
+}
 
 async function post(path, body) {
   const res = await fetch(path, {
@@ -413,54 +497,110 @@ async function refresh(force) {
 }
 
 function render(state) {
-  const mcp = state.agent.mcp;
+  lastState = state;
+  const links = state.agent.links;
   const srv = state.server;
+  titles = Object.fromEntries(srv.servers.map((s) => [s.key, s.title]));
+  fast = state.agent.pipeline.running || Boolean(state.agent.working) || pending;
 
   $('model').textContent = state.agent.model;
-  $('mcp-url').textContent = mcp.url;
+  renderLinks(links, srv.servers, state.agent.messages.length);
 
-  // --- состояние соединения
-  const connected = mcp.connected;
-  $('dot').className = 'dot' + (connected ? ' on' : '');
-  $('conn-title').textContent = connected ? 'Соединение с MCP установлено' : 'Нет соединения';
-  $('conn-sub').textContent = connected
-    ? `сервер «${mcp.info.server}» · версия ${mcp.info.version} · протокол ${mcp.info.protocol}`
-    : (srv.server_on ? 'нажмите «Подключиться»' : 'сервер выключен в правой панели');
-  const btn = $('btn-connect');
-  btn.textContent = connected ? 'Отключиться' : 'Подключиться';
-  btn.className = connected ? '' : 'primary';
-  btn.onclick = () => post(connected ? '/api/mcp/disconnect' : '/api/mcp/connect');
-  $('btn-refresh').disabled = !connected;
-
-  const problem = lastError || (!connected && mcp.error ? mcp.error : '');
-  $('conn-error').hidden = !problem;
-  $('conn-error').textContent = problem;
-
-  // --- инструменты, которые агент получил от сервера
-  $('tools-count').textContent = connected ? `(${mcp.tools.length})` : '';
-  const chips = $('agent-tools');
-  chips.innerHTML = '';
-  if (!mcp.tools.length) {
-    chips.innerHTML = '<span class="chip empty">пока ничего: список приходит после подключения</span>';
-  } else {
-    for (const t of mcp.tools) {
-      const el = document.createElement('span');
-      el.className = 'chip';
-      el.textContent = t.name;
-      el.title = t.description;
-      chips.appendChild(el);
-    }
-  }
-
-  renderReport(state.agent.report, connected);
-  renderPipeline(state.agent.pipeline, connected);
-  renderChat(state.agent.messages);
-  renderLog(mcp.log);
-  renderServer(srv);
+  const github = links.find((l) => l.key === 'github');
+  renderReport(state.agent.report, github && github.connected);
+  renderPipeline(state.agent.pipeline, github && github.connected);
+  renderChat(state.agent.messages, state.agent.working, links.some((l) => l.connected));
+  renderLog(state.agent.log);
+  renderServers(srv.servers, srv.auth);
+  renderTools(srv.servers);
+  renderPackages(srv.packages);
+  renderRepo(srv);
   renderReports(state.reports);
   renderWatch(state.watch);
   painted = true;
   tick();
+}
+
+// --- соединения агента: строка на каждый сервер из реестра
+function renderLinks(links, servers, messages) {
+  const up = links.filter((l) => l.connected).length;
+  const all = up === links.length;
+  $('dot').className = 'dot' + (all ? ' on' : up ? ' half' : '');
+  $('conn-title').textContent = !up ? 'Нет соединения с MCP-серверами'
+    : all ? `Подключены все MCP-серверы: ${up} из ${links.length}`
+      : `Подключено ${up} из ${links.length} MCP-серверов`;
+  const btn = $('btn-connect');
+  btn.textContent = all ? 'Отключиться' : 'Подключиться';
+  btn.className = all ? '' : 'primary';
+  btn.onclick = () => post(all ? '/api/mcp/disconnect' : '/api/mcp/connect');
+  $('btn-refresh').disabled = !up;
+
+  const box = $('links');
+  box.innerHTML = '';
+  for (const link of links) {
+    const server = servers.find((s) => s.key === link.key);
+    const dot = document.createElement('span');
+    dot.className = 'dot' + (link.connected ? ' on' : '');
+    const sub = document.createElement('span');
+    sub.className = 'link-sub';
+    if (link.connected) {
+      sub.textContent = `сервер «${link.info.server}» · версия ${link.info.version} · протокол ${link.info.protocol} · ` +
+        plural(link.tools.length, 'инструмент', 'инструмента', 'инструментов');
+    } else if (server && !server.on) {
+      sub.textContent = 'выключен в правой панели';
+      sub.classList.add('bad');
+    } else if (link.error) {
+      sub.textContent = link.error;
+      sub.classList.add('bad');
+    } else {
+      sub.textContent = 'не подключён · ' + link.url;
+    }
+    sub.title = link.url;
+    box.append(dot, srvTag(link.key), sub);
+  }
+
+  $('conn-error').hidden = !lastError;
+  $('conn-error').textContent = lastError;
+
+  // Инструменты, которые агент получил от серверов. Нужны в начале; начался
+  // разговор — список сворачивается в строку, место отдаём чату.
+  const total = links.reduce((n, l) => n + l.tools.length, 0);
+  const open = toolsOpen ?? !messages;
+  const toggle = $('tools-toggle');
+  toggle.className = 'label tools-toggle' + (!total ? ' none' : open ? ' open' : '');
+  toggle.textContent = 'Инструменты, полученные от серверов' + (total ? ` (${total})` : '');
+  if (total) {
+    const more = document.createElement('span');
+    more.className = 'more';
+    const counts = links.filter((l) => l.tools.length).map((l) => `${titles[l.key] || l.key} ${l.tools.length}`);
+    more.textContent = open ? ' · свернуть' : ` — ${counts.join(' · ')} · показать`;
+    toggle.appendChild(more);
+  }
+  toggle.onclick = () => { if (total) { toolsOpen = !open; render(lastState); } };
+
+  const chips = $('agent-tools');
+  chips.innerHTML = '';
+  if (!total) {
+    chips.innerHTML = '<div class="tool-server"><span class="chip empty">пока ничего: список приходит после подключения</span></div>';
+    return;
+  }
+  if (!open) return;
+  // Одним потоком: плашка сервера открывает его инструменты — строк меньше, чату
+  // остаётся больше места.
+  const row = document.createElement('div');
+  row.className = 'tool-server';
+  for (const link of links) {
+    if (!link.tools.length) continue;
+    row.appendChild(srvTag(link.key));
+    for (const t of link.tools) {
+      const el = document.createElement('span');
+      el.className = 'chip';
+      el.textContent = t.name;
+      el.title = t.description;
+      row.appendChild(el);
+    }
+  }
+  chips.appendChild(row);
 }
 
 // --- пайплайн: три шага, каждый — отдельный tools/call; стрелка — передача данных
@@ -469,7 +609,6 @@ const STEP_ICONS = {idle: '', run: '', done: '✓ ', error: '✕ ', skip: ''};
 const STEP_DOING = ['ищем строки в коде через GitHub', 'модель пишет сводку', 'записываем отчёт на диск'];
 
 function renderPipeline(pipe, connected) {
-  fast = pipe.running;
   const run = $('pipe-run');
   run.disabled = !connected || pipe.running;
   run.textContent = pipe.running ? 'Идёт…' : 'Запустить';
@@ -479,13 +618,14 @@ function renderPipeline(pipe, connected) {
   status.textContent = pipe.running
     ? `шаг ${current + 1} из 3: ${STEP_DOING[current] || 'выполняется'}`
     : !connected
-      ? 'сначала подключитесь к MCP-серверу'
-      : pipe.status || 'ответ каждого шага уходит на вход следующему';
+      ? 'сначала подключитесь к серверу GitHub'
+      : pipe.status || 'поиск по коду → сводка → файл';
   status.title = status.textContent;
 
   // Карточки и стрелки создаются один раз, дальше меняются только класс и текст:
   // так цвет шага переходит плавно, а не мигает при каждой перерисовке.
   const box = $('stages');
+  box.hidden = !pipe.running && pipe.steps.every((s) => s.state === 'idle');
   if (!box.children.length) {
     pipe.steps.forEach((step, i) => {
       if (i) box.insertAdjacentHTML('beforeend', '<div class="arrow">➜</div>');
@@ -535,7 +675,7 @@ function renderReports(list) {
   const box = $('reports');
   box.innerHTML = '';
   if (!list.length) {
-    box.innerHTML = '<div class="empty-row">пока пусто: запустите пайплайн слева</div>';
+    box.innerHTML = '<div class="empty-row">пока пусто: запустите пайплайн или попросите агента сохранить отчёт</div>';
   }
   for (const r of list) {
     const row = document.createElement('div');
@@ -575,11 +715,15 @@ function tick() {
   const status = $('auto-status');
   const ts = Number(status.dataset.ts);
   status.textContent = status.dataset.base + (ts ? ` · следующая через ${countdown(ts)}` : '');
+  const now = Date.now() / 1000;
   for (const el of document.querySelectorAll('[data-next]')) {
     el.textContent = 'следующая проверка через ' + countdown(Number(el.dataset.next));
   }
   for (const el of document.querySelectorAll('[data-started]')) {
-    el.textContent = `идёт ${Math.max(0, Math.round(Date.now() / 1000 - Number(el.dataset.started)))} с`;
+    el.textContent = `идёт ${Math.max(0, Math.round(now - Number(el.dataset.started)))} с`;
+  }
+  for (const el of document.querySelectorAll('[data-since]')) {
+    el.textContent = `${Math.max(0, Math.round(now - Number(el.dataset.since)))} с`;
   }
 }
 
@@ -640,65 +784,157 @@ function renderWatch(watch) {
   }
 }
 
+// --- правая панель: серверы с выключателями и откуда они берут данные
+function renderServers(servers, auth) {
+  const on = servers.filter((s) => s.on).length;
+  $('servers-pill').textContent = `включено ${on} из ${servers.length}`;
+  const list = $('server-list');
+  list.innerHTML = '';
+  for (const s of servers) {
+    const row = document.createElement('div');
+    row.className = 'server-row';
+    row.innerHTML = '<div class="server-text"><div class="server-name"><code></code></div>' +
+      '<div class="card-sub source"></div><div class="warn-line off-note" hidden></div>' +
+      '<div class="warn-line anon-note" hidden></div></div><div class="switch"><button></button></div>';
+    row.querySelector('.server-name').prepend(srvTag(s.key));
+    row.querySelector('code').textContent = s.url;
+    let source = `источник данных: ${s.source}`;
+    if (s.key === 'github') {
+      const left = auth.remaining === null
+        ? 'лимит пока не известен'
+        : `осталось ${auth.remaining} из ${auth.limit} запросов в час`;
+      source += ` · токен ${auth.source} · ${left}`;
+      const anon = row.querySelector('.anon-note');
+      anon.hidden = auth.authorized;
+      anon.innerHTML = 'Токена нет: GitHub отвечает, но даёт 60 запросов в час. Свой ключ — в <code>GITHUB_TOKEN</code>.';
+    }
+    row.querySelector('.source').textContent = source;
+    const note = row.querySelector('.off-note');
+    note.hidden = s.on;
+    note.textContent = 'Сервер выключен: соединение агента закрыто, новые подключения получают 503.';
+    const power = row.querySelector('button');
+    power.textContent = s.on ? 'ВКЛ' : 'ВЫКЛ';
+    power.className = s.on ? '' : 'off';
+    power.onclick = () => post('/api/server', {server: s.key, on: !s.on});
+    list.appendChild(row);
+  }
+}
+
 const TOOL_GROUPS = {
   live: 'по запросу — живой GitHub',
   pipeline: 'пайплайн — поиск → сводка → файл',
   schedule: 'по расписанию — наблюдение и сводка',
+  packages: 'по запросу — живые PyPI и OSV.dev',
 };
 
-function renderServer(srv) {
-  // --- выключатель сервера и то, откуда он берёт данные
-  const power = $('server-toggle');
-  power.textContent = srv.server_on ? 'ВКЛ' : 'ВЫКЛ';
-  power.className = srv.server_on ? '' : 'off';
-  power.onclick = () => post('/api/server', {on: !srv.server_on});
-  $('server-off-note').hidden = srv.server_on;
-
-  const auth = srv.auth;
-  const left = auth.remaining === null
-    ? 'лимит пока не известен'
-    : `осталось ${auth.remaining} из ${auth.limit} запросов в час`;
-  $('api-line').textContent = `источник данных: ${srv.api} · токен ${auth.source} · ${left}`;
-  $('anon-note').hidden = auth.authorized;
-
-  // --- инструменты сервера с их входными параметрами
-  const on = srv.tools.filter((t) => t.on).length;
-  $('tools-pill').textContent = `включено ${on} из ${srv.tools.length}`;
+// --- инструменты каждого сервера с их входными параметрами
+function renderTools(servers) {
+  const all = servers.flatMap((s) => s.tools);
+  $('tools-pill').textContent = `включено ${all.filter((t) => t.on).length} из ${all.length}`;
   const list = $('tool-list');
   list.innerHTML = '';
-  let group = null;
-  for (const tool of srv.tools) {
-    if (tool.group !== group) {
-      group = tool.group;
-      const head = document.createElement('div');
-      head.className = 'label tool-group';
-      head.textContent = TOOL_GROUPS[group];
-      list.appendChild(head);
-    }
-    const row = document.createElement('label');
-    row.className = 'tool-row' + (tool.on ? '' : ' off');
-    const box = document.createElement('input');
-    box.type = 'checkbox';
-    box.checked = tool.on;
-    box.onchange = () => post('/api/tool', {name: tool.name, on: box.checked});
+  for (const s of servers) {
+    const head = document.createElement('div');
+    head.className = 'tool-server-head';
+    const count = document.createElement('span');
+    count.className = 'pill';
+    count.textContent = `включено ${s.tools.filter((t) => t.on).length} из ${s.tools.length}` + (s.on ? '' : ' · сервер выключен');
+    head.append(srvTag(s.key), count);
+    list.appendChild(head);
 
-    const text = document.createElement('div');
-    text.innerHTML = '<div class="tool-name"></div><div class="tool-desc"></div><div class="tool-params"></div>';
-    text.querySelector('.tool-name').textContent = tool.name;
-    text.querySelector('.tool-desc').textContent = tool.description;
-    const params = text.querySelector('.tool-params');
-    for (const param of tool.params) {
-      const tag = document.createElement('span');
-      tag.className = 'param' + (param.required ? '' : ' optional');
-      tag.textContent = param.name;
-      tag.title = param.required ? 'обязательный параметр' : 'необязательный параметр';
-      params.appendChild(tag);
+    let group = null;
+    for (const tool of s.tools) {
+      if (tool.group !== group) {
+        group = tool.group;
+        const label = document.createElement('div');
+        label.className = 'label tool-group';
+        label.textContent = TOOL_GROUPS[group] || group;
+        list.appendChild(label);
+      }
+      const row = document.createElement('label');
+      row.className = 'tool-row' + (tool.on ? '' : ' off');
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = tool.on;
+      box.onchange = () => post('/api/tool', {server: s.key, name: tool.name, on: box.checked});
+
+      const text = document.createElement('div');
+      text.innerHTML = '<div class="tool-name"></div><div class="tool-desc"></div><div class="tool-params"></div>';
+      text.querySelector('.tool-name').textContent = tool.name;
+      text.querySelector('.tool-desc').textContent = tool.description;
+      const params = text.querySelector('.tool-params');
+      for (const param of tool.params) {
+        const tag = document.createElement('span');
+        tag.className = 'param' + (param.required ? '' : ' optional');
+        tag.textContent = param.name;
+        tag.title = param.required ? 'обязательный параметр' : 'необязательный параметр';
+        params.appendChild(tag);
+      }
+      row.append(box, text);
+      list.appendChild(row);
     }
-    row.append(box, text);
-    list.appendChild(row);
   }
+}
 
-  // --- сама карточка репозитория
+// --- то, что сервер «Зависимости» уже проверил: обновлённая строка подсвечивается
+const seenPackages = new Map();
+
+function renderPackages(rows) {
+  $('packages-pill').textContent = rows.length ? `пакетов ${rows.length}` : '';
+  $('packages-clear').disabled = !rows.length;
+  const box = $('packages');
+  box.innerHTML = '';
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty-row">пока пусто: спросите агента «Проверь зависимости проекта»</div>';
+  }
+  for (const p of rows) {
+    const item = document.createElement('div');
+    item.className = 'row-item';
+    if (seenPackages.get(p.name) !== p.time) {
+      if (painted) item.classList.add('flash');
+      seenPackages.set(p.name, p.time);
+    }
+    item.innerHTML = '<div class="row-title"><span class="pkg-name"></span><span class="pkg-flag"></span></div>';
+    item.querySelector('.pkg-name').textContent = p.name;
+    const flag = item.querySelector('.pkg-flag');
+    if (p.vulns === null) {
+      flag.textContent = 'уязвимости не проверялись';
+    } else if (!p.vulns) {
+      flag.textContent = '✓ уязвимостей нет';
+      flag.classList.add('ok');
+    } else {
+      flag.textContent = '⚠ ' + plural(p.vulns, 'уязвимость', 'уязвимости', 'уязвимостей');
+      flag.classList.add('bad');
+    }
+    const facts = [
+      p.checked ? `проверена ${p.checked}` + (p.checked_date ? ` (${p.checked_date})` : '') : '',
+      p.latest ? `последняя ${p.latest}` + (p.latest_date ? ` (${p.latest_date})` : '') : '',
+      p.newer ? 'новее ' + plural(p.newer, 'выпуск', 'выпуска', 'выпусков') : '',
+    ].filter(Boolean);
+    if (facts.length) {
+      const sub = document.createElement('div');
+      sub.className = 'row-sub';
+      sub.textContent = facts.join(' · ');
+      item.appendChild(sub);
+    }
+    for (const v of p.found.slice(0, 3)) {
+      const sub = document.createElement('div');
+      sub.className = 'row-sub bad';
+      sub.textContent = `${v.id} · опасность ${v.severity} · исправлено в ${v.fixed.join(', ')}`;
+      item.appendChild(sub);
+    }
+    if (p.found.length > 3) {
+      const sub = document.createElement('div');
+      sub.className = 'row-sub bad';
+      sub.textContent = `и ещё ${p.found.length - 3}`;
+      item.appendChild(sub);
+    }
+    box.appendChild(item);
+  }
+}
+
+// --- карточка репозитория, последние коммиты и открытые задачи
+function renderRepo(srv) {
   $('repo-refresh').disabled = srv.loading;
   $('repo-updated').textContent = srv.loading
     ? 'спрашиваем GitHub…'
@@ -781,6 +1017,100 @@ function markup(text) {
   return safe.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/`([^`\n]+)`/g, '<code>$1</code>');
 }
 
+// --- маршрут: вызовы одного хода модели с одним инструментом — одна строка
+function groupCalls(calls) {
+  const groups = [];
+  calls.forEach((call, i) => {
+    const round = call.round ?? i;
+    const server = call.server || 'github';
+    let group = groups.find((g) => g.round === round && g.server === server && g.name === call.name);
+    if (!group) {
+      group = {round, server, name: call.name, calls: []};
+      groups.push(group);
+    }
+    group.calls.push(call);
+  });
+  return groups;
+}
+
+// О чём вызов, коротко: путь, пакет с версией, запрос.
+function subject(call) {
+  const a = call.arguments || {};
+  if (call.name === 'vulnerabilities' || call.name === 'package_info') {
+    return a.version ? `${a.name} ${a.version}` : a.name || '';
+  }
+  if ('path' in a && typeof a.path === 'string') return a.path || 'корень';
+  for (const key of ['name', 'query', 'sha', 'repo']) {
+    if (typeof a[key] === 'string' && a[key]) return a[key];
+  }
+  if (a.limit) return `последние ${a.limit}`;
+  if (a.minutes) return `за ${a.minutes} мин`;
+  if (a.every_minutes) return `каждые ${a.every_minutes} мин`;
+  if (a.watch_id) return `№${a.watch_id}`;
+  if (a.found) return 'ответ поиска';
+  return '';
+}
+
+function routeList(calls) {
+  const box = document.createElement('div');
+  box.className = 'route';
+  groupCalls(calls).forEach((group, i) => {
+    const ok = group.calls.filter((c) => c.ok === true).length;
+    const bad = group.calls.filter((c) => c.ok === false).length;
+    const running = group.calls.length - ok - bad;
+    const count = group.calls.length;
+    const n = document.createElement('span');
+    n.className = 'n';
+    n.textContent = i + 1;
+    const tool = document.createElement('span');
+    tool.className = 'tool';
+    tool.textContent = group.name + (count > 1 ? ` × ${count}` : '');
+    const args = document.createElement('span');
+    args.className = 'args';
+    args.textContent = [...new Set(group.calls.map(subject).filter(Boolean))].join(', ');
+    args.title = args.textContent;
+    const st = document.createElement('span');
+    st.className = 'st ' + (running ? 'run' : bad ? 'error' : 'done');
+    st.textContent = running ? (count > 1 ? `идёт ${ok + bad}/${count}` : 'идёт')
+      : bad ? `✕ ${bad}` + (ok ? ` · ✓ ${ok}` : '') : '✓';
+    box.append(n, srvTag(group.server), tool, args, st);
+  });
+  return box;
+}
+
+// Строка маршрута под ответом: подряд идущие вызовы одного сервера — один переход.
+function hopsLine(calls, open) {
+  const hops = [];
+  for (const group of groupCalls(calls)) {
+    const last = hops[hops.length - 1];
+    if (last && last.server === group.server) last.count += group.calls.length;
+    else hops.push({server: group.server, count: group.calls.length});
+  }
+  const line = document.createElement('span');
+  line.className = 'hops';
+  line.title = open ? 'свернуть маршрут' : 'показать все вызовы по порядку';
+  hops.forEach((hop, i) => {
+    if (i) {
+      const arr = document.createElement('span');
+      arr.className = 'arr';
+      arr.textContent = '→';
+      line.appendChild(arr);
+    }
+    line.appendChild(srvTag(hop.server));
+    if (hop.count > 1) {
+      const times = document.createElement('span');
+      times.className = 'times';
+      times.textContent = `×${hop.count}`;
+      line.appendChild(times);
+    }
+  });
+  const more = document.createElement('span');
+  more.className = 'more';
+  more.textContent = ' · ' + plural(calls.length, 'вызов', 'вызова', 'вызовов') + (open ? ' ▾' : ' ▸');
+  line.appendChild(more);
+  return line;
+}
+
 // Сообщения, которые агент прислал сам, без вопроса в чате.
 const MESSAGE_HEADS = {
   report: (m) => `📋 Сводка агента · ${m.time} — пришла сама, без вопроса`,
@@ -789,19 +1119,25 @@ const MESSAGE_HEADS = {
 
 let shownMessages = 0;   // сколько сообщений было на прошлой отрисовке
 
-function renderChat(messages) {
+function renderChat(messages, working, connected) {
   const chat = $('chat');
+  const busy = pending || Boolean(working);
   const atBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 60;
   const scrolled = chat.scrollTop;
   const grew = messages.length > shownMessages;
-  if (!pending) shownMessages = messages.length;   // ответ ещё в пути — новым он станет по приходу
+  if (messages.length < shownMessages) openRoutes.clear();   // чат очистили
+  if (!busy) shownMessages = messages.length;   // ответ ещё в пути — новым он станет по приходу
   chat.innerHTML = '';
 
-  if (!messages.length && !pending) {
+  if (!messages.length && !busy) {
     const hint = document.createElement('div');
     hint.className = 'empty-chat';
     hint.innerHTML = '<p></p><div class="examples"></div>';
-    hint.querySelector('p').textContent = 'Подключитесь к MCP-серверу и спросите про репозиторий. Агент ответит только тем, что достанет инструментами из GitHub.';
+    // После подключения над чатом список инструментов — подсказка в одну строку,
+    // чтобы примеры поместились.
+    hint.querySelector('p').textContent = connected
+      ? 'Спросите — агент сам выберет, к какому серверу идти:'
+      : 'Подключитесь к MCP-серверам и спросите про репозиторий или его зависимости. Агент сам выберет, к какому серверу идти, и ответит только тем, что достанет инструментами.';
     for (const text of EXAMPLES) {
       const chip = document.createElement('button');
       chip.className = 'example';
@@ -812,7 +1148,7 @@ function renderChat(messages) {
     chat.appendChild(hint);
   }
 
-  for (const m of messages) {
+  messages.forEach((m, index) => {
     const wrap = document.createElement('div');
     wrap.className = 'msg ' + (m.role === 'user' ? 'user' : 'bot') + (MESSAGE_HEADS[m.kind] ? ' report' : '');
     const bubble = document.createElement('div');
@@ -829,33 +1165,65 @@ function renderChat(messages) {
     if (m.role === 'assistant') {
       const meta = document.createElement('div');
       meta.className = 'meta';
-      for (const call of m.calls || []) {
-        const tag = document.createElement('span');
-        tag.className = 'used' + (call.ok ? '' : ' bad');
-        tag.textContent = (call.ok ? '⚙ ' : '✕ ') + call.name;
-        tag.title = JSON.stringify(call.arguments);
-        meta.appendChild(tag);
+      const calls = m.calls || [];
+      const open = openRoutes.has(index);
+      if (calls.length) {
+        const hops = hopsLine(calls, open);
+        hops.onclick = () => {
+          if (openRoutes.has(index)) openRoutes.delete(index); else openRoutes.add(index);
+          render(lastState);
+        };
+        meta.appendChild(hops);
       }
       const cost = document.createElement('span');
       cost.textContent = `${m.tokens} токенов · ${m.seconds} с`;
       meta.appendChild(cost);
       wrap.appendChild(meta);
+      if (calls.length && open) {
+        const box = document.createElement('div');
+        box.className = 'route-box';
+        box.appendChild(routeList(calls));
+        wrap.appendChild(box);
+      }
     }
+    chat.appendChild(wrap);
+  });
+
+  // Агент работает: вызовы видны по мере того, как уходят на серверы.
+  if (busy) {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg bot';
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble work';
+    if (working) {
+      const head = document.createElement('div');
+      head.className = 'work-head';
+      const since = document.createElement('span');
+      since.dataset.since = working.started;
+      head.append('Агент работает · ', since);
+      bubble.appendChild(head);
+      if (working.calls.length) bubble.appendChild(routeList(working.calls));
+      const phase = document.createElement('div');
+      phase.className = 'work-phase';
+      phase.textContent = working.phase === 'tools' ? 'идут вызовы на серверы…'
+        : working.calls.length ? 'модель решает, что дальше…' : 'модель выбирает инструменты…';
+      bubble.appendChild(phase);
+    } else {
+      bubble.textContent = 'Агент думает…';
+    }
+    wrap.appendChild(bubble);
     chat.appendChild(wrap);
   }
 
-  if (pending) {
-    const wrap = document.createElement('div');
-    wrap.className = 'msg bot';
-    wrap.innerHTML = '<div class="bubble">Агент думает…</div>';
-    chat.appendChild(wrap);
-  }
-  // Пришло новое сообщение выше окна чата — показываем его с начала, а не с хвоста.
-  // Иначе оставляем прокрутку как была: перерисовка не должна дёргать чат.
+  // Пока агент работает — держим низ: там свежие вызовы. Пришёл ответ выше окна
+  // чата — показываем его с начала, а не с хвоста. Иначе прокрутка как была:
+  // перерисовка не должна дёргать чат.
   const last = chat.lastElementChild;
-  if (!messages.length && !pending) {
+  if (!messages.length && !busy) {
     chat.scrollTop = 0;
-  } else if ((grew || pending) && last) {
+  } else if (busy) {
+    chat.scrollTop = chat.scrollHeight;
+  } else if (grew && last) {
     chat.scrollTop = last.offsetHeight > chat.clientHeight ? last.offsetTop - 16 : chat.scrollHeight;
   } else {
     chat.scrollTop = atBottom ? chat.scrollHeight : scrolled;
@@ -867,13 +1235,14 @@ function renderLog(log) {
   const box = $('log');
   box.innerHTML = '';
   log.forEach((entry, index) => {
-    const key = entry.time + entry.method + index;
+    const key = entry.time + entry.server + entry.method + index;
     const line = document.createElement('div');
     line.className = 'log-line' + (entry.ok ? '' : ' bad') + (openLogs.has(key) ? ' open' : '');
     const head = document.createElement('div');
     head.className = 'log-head';
     head.innerHTML = '<span class="log-time"></span><span class="log-method"></span><span class="log-sum"></span>';
     head.querySelector('.log-time').textContent = entry.time;
+    head.querySelector('.log-time').after(srvTag(entry.server));
     head.querySelector('.log-method').textContent = entry.method;
     head.querySelector('.log-sum').textContent = entry.summary;
     head.onclick = () => {
@@ -912,6 +1281,7 @@ $('input').onkeydown = (e) => {
 };
 $('btn-refresh').onclick = () => post('/api/mcp/refresh');
 $('repo-refresh').onclick = () => post('/api/repo/refresh');
+$('packages-clear').onclick = () => post('/api/packages/clear');
 $('auto-every').onchange = (e) => post('/api/report', {minutes: Number(e.target.value)});
 $('auto-now').onclick = () => post('/api/report/now');
 
@@ -925,7 +1295,8 @@ $('pipe-query').onkeydown = (e) => {
   if (e.key === 'Enter' && !$('pipe-run').disabled) { e.preventDefault(); runPipeline(); }
 };
 
-// Пока идёт пайплайн, состояние спрашиваем чаще — шаги загораются без запаздывания.
+// Пока работает агент или пайплайн, состояние спрашиваем чаще — вызовы и шаги
+// загораются без запаздывания.
 async function poll() {
   try {
     await refresh(false);

@@ -1,13 +1,16 @@
 """Агент с чатом: MCP-клиент плюс вызов модели.
 
-Это вторая половина проекта. Агент подключается к MCP-серверу официальным
-клиентом из SDK (`mcp.Client`) по сети, получает от него список инструментов и
-отдаёт этот список модели. Всё, что уходит по протоколу и приходит обратно,
-попадает в журнал обмена — его видно в интерфейсе.
+Это вторая половина проекта. Агент подключается к нескольким MCP-серверам из
+реестра (`config.MCP_SERVERS`) официальным клиентом из SDK (`mcp.Client`) по
+сети — у каждого сервера своя сессия. Инструменты всех серверов он отдаёт
+модели одним списком, а вызовы сам разводит по серверам: имя инструмента для
+модели начинается с имени сервера (`github__read_file`, `deps__package_info`).
+Всё, что уходит по протоколу и приходит обратно, попадает в общий журнал
+обмена с пометкой сервера — его видно в интерфейсе.
 
 Кроме ответов на вопросы агент умеет работать сам: `AutoReport` раз в N минут
-спрашивает у сервера сводку наблюдения и присылает её в чат, а `Pipeline`
-проводит цепочку из трёх инструментов «поиск → сводка → файл».
+спрашивает у сервера GitHub сводку наблюдения и присылает её в чат, а
+`Pipeline` проводит цепочку из трёх инструментов «поиск → сводка → файл».
 """
 import asyncio
 import json
@@ -24,30 +27,64 @@ from . import config
 logger = logging.getLogger("app.agent")
 
 SYSTEM = (
-    "Ты — ассистент по репозиторию на GitHub. Отвечай по-русски, коротко и по делу.\n"
-    "Всё о репозитории — коммиты, файлы, задачи — ты узнаёшь ТОЛЬКО через "
-    "инструменты MCP-сервера. Ничего не придумывай: нет инструмента — так и скажи.\n"
+    "Ты — ассистент по репозиторию на GitHub и его зависимостям. Отвечай по-русски, "
+    "коротко и по делу.\n"
+    "Инструменты приходят с нескольких MCP-серверов: имя инструмента начинается с "
+    "имени сервера и двух подчёркиваний, например github__read_file. Всё о "
+    "репозитории и пакетах ты узнаёшь ТОЛЬКО через инструменты. Ничего не "
+    "придумывай: нет инструмента — так и скажи.\n"
     "Если нужен хеш коммита или путь к файлу, сначала возьми список, а потом "
-    "запрашивай подробности. Опирайся на то, что вернули инструменты: хеши, "
-    "даты, имена файлов, номера задач.\n"
-    "Где в коде встречается слово или имя — ищи инструментом search_code.\n"
+    "запрашивай подробности. Опирайся на то, что вернули инструменты: хеши, даты, "
+    "имена файлов, номера задач, версии.\n"
+    "Где в коде встречается слово или имя — ищи через github__search_code.\n"
+    "Вызовы, которые не зависят друг от друга (например, проверку нескольких "
+    "пакетов), делай за один ход.\n"
     "Если просят следить за репозиторием или присылать сводку — заведи наблюдение "
-    "инструментом watch_repo. На вопросы «что произошло за час / за день» отвечай "
-    "по watch_summary."
+    "через github__watch_repo. На вопросы «что произошло за час / за день» отвечай "
+    "по github__watch_summary."
 )
 NO_TOOLS_NOTE = (
-    "\nСейчас соединение с MCP-сервером не установлено и инструментов у тебя нет. "
+    "\nСейчас ни одного соединения с MCP-серверами нет и инструментов у тебя нет. "
     "Скажи об этом прямо и предложи нажать «Подключиться»."
 )
+
+# Имя инструмента для модели: «сервер__инструмент». По приставке агент и
+# отправляет вызов нужному серверу.
+SEP = "__"
 
 # Переписка живёт в памяти процесса: перезапуск начинает разговор заново.
 history: list[dict] = []
 revision = 0
 
+# Общий журнал обмена со всеми серверами: у каждой строки пометка, с каким
+# сервером шёл обмен.
+journal: list[dict] = []
+
+# Ход текущего обращения к агенту: интерфейс показывает вызовы по мере того,
+# как они идут. None — агент свободен.
+working: dict | None = None
+
 
 def _touch() -> None:
     global revision
     revision += 1
+
+
+def _note(server: str, method: str, summary: str, detail: object = None, ok: bool = True) -> None:
+    """Строка журнала обмена: время, сервер, метод протокола, суть и подробности."""
+    detail_text = ""
+    if detail is not None:
+        detail_text = json.dumps(detail, ensure_ascii=False, indent=2, default=str)
+    journal.append({
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "server": server,
+        "method": method,
+        "summary": summary,
+        "ok": ok,
+        "detail": detail_text,
+    })
+    del journal[:-60]  # на экране нужна свежая часть, а не весь день
+    _touch()
 
 
 def _reason(error: BaseException) -> str:
@@ -71,38 +108,26 @@ def _reason(error: BaseException) -> str:
 
 
 class McpLink:
-    """Живое соединение с MCP-сервером.
+    """Живое соединение с одним MCP-сервером.
 
     Сессия висит в фоновой задаче: войти в неё и выйти нужно в одной и той же
     задаче, иначе anyio ругается на чужой cancel scope. Остальной код работает
-    с уже открытым клиентом из любой задачи.
+    с уже открытым клиентом из любой задачи — в том числе несколькими вызовами
+    сразу.
     """
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, key: str, url: str) -> None:
+        self.key = key      # имя сервера в реестре — приставка к его инструментам
         self.url = url
         self.info: dict | None = None
         self.tools: list[dict] = []
         self.error: str | None = None
-        self.log: list[dict] = []
         self._client: Client | None = None
         self._task: asyncio.Task | None = None
         self._stop: asyncio.Event | None = None
 
-    # --- журнал обмена ------------------------------------------------------
-
     def note(self, method: str, summary: str, detail: object = None, ok: bool = True) -> None:
-        detail_text = ""
-        if detail is not None:
-            detail_text = json.dumps(detail, ensure_ascii=False, indent=2, default=str)
-        self.log.append({
-            "time": datetime.now().strftime("%H:%M:%S"),
-            "method": method,
-            "summary": summary,
-            "ok": ok,
-            "detail": detail_text,
-        })
-        del self.log[:-40]  # на экране нужна свежая часть, а не весь день
-        _touch()
+        _note(self.key, method, summary, detail, ok)
 
     # --- жизненный цикл соединения -----------------------------------------
 
@@ -157,6 +182,8 @@ class McpLink:
         await self.list_tools()
 
     async def disconnect(self, reason: str = "по кнопке") -> None:
+        if self._task is None:  # соединения не было — закрывать нечего
+            return
         if self._stop is not None:
             self._stop.set()
         if self._task is not None:
@@ -214,16 +241,49 @@ class McpLink:
 
     def snapshot(self) -> dict:
         return {
+            "key": self.key,
             "connected": self.connected,
             "url": self.url,
             "info": self.info,
             "error": self.error,
             "tools": [{"name": t["name"], "description": t["description"]} for t in self.tools],
-            "log": self.log,
         }
 
 
-link = McpLink(config.MCP_URL)
+# Соединения по реестру серверов: имя → живая сессия.
+links: dict[str, McpLink] = {key: McpLink(key, url) for key, url in config.MCP_SERVERS.items()}
+
+
+async def connect_all() -> None:
+    """Подключиться ко всем серверам реестра, которые ещё не подключены.
+
+    Сервер, до которого достучаться не вышло, не мешает остальным: причина
+    остаётся у его соединения (`link.error`) и строкой в журнале.
+    """
+    for link in links.values():
+        if not link.connected:
+            try:
+                await link.connect()
+            except Exception:
+                pass
+
+
+async def disconnect_all(reason: str = "по кнопке") -> None:
+    for link in links.values():
+        await link.disconnect(reason)
+
+
+async def refresh_all() -> str | None:
+    """Перезапросить tools/list у всех подключённых серверов."""
+    errors = []
+    for link in links.values():
+        if link.connected:
+            try:
+                await link.list_tools()
+            except Exception as e:
+                errors.append("{0}: {1}".format(link.key, _reason(e)))
+    return "; ".join(errors) or None
+
 
 _client: OpenAI | None = None
 
@@ -238,78 +298,153 @@ def _model_client() -> OpenAI:
 
 
 def _call_model(messages: list[dict], tools: list[dict]):
-    """Один вызов модели. Клиент синхронный — зовём его из отдельного потока."""
-    extra = {"tools": tools, "tool_choice": "auto"} if tools else {}
+    """Один вызов модели. Клиент синхронный — зовём его из отдельного потока.
+
+    `parallel_tool_calls` разрешает модели за один ход попросить несколько
+    независимых вызовов: шесть пакетов проверяются за один круг, а не за шесть.
+    """
+    extra = {"tools": tools, "tool_choice": "auto", "parallel_tool_calls": True} if tools else {}
     return _model_client().chat.completions.create(
         model=config.MODEL, messages=messages, **extra,
     )
 
 
 def _tools_for_model() -> list[dict]:
-    """Инструменты MCP в формате function calling — как их видит модель."""
+    """Инструменты всех подключённых серверов в формате function calling.
+
+    Имя для модели — «сервер__инструмент»: по приставке агент потом и решает,
+    какому серверу отдать вызов.
+    """
     return [
         {"type": "function",
-         "function": {"name": t["name"], "description": t["description"], "parameters": t["schema"]}}
+         "function": {"name": link.key + SEP + t["name"], "description": t["description"],
+                      "parameters": t["schema"]}}
+        for link in links.values() if link.connected
         for t in link.tools
     ]
 
 
+def _system() -> str:
+    """Системный промпт: общие правила плюс то, что о себе сказали подключённые серверы."""
+    up = [link for link in links.values() if link.connected]
+    if not up:
+        return SYSTEM + NO_TOOLS_NOTE
+    lines = [SYSTEM, "", "Подключённые MCP-серверы — что они сказали о себе при подключении:"]
+    lines += ["• {0}: {1}".format(link.key, link.info["instructions"] or "без описания") for link in up]
+    down = [link.key for link in links.values() if not link.connected]
+    if down:
+        lines.append("Не подключены: {0}. Если для ответа нужны их инструменты — скажи "
+                     "об этом прямо.".format(", ".join(down)))
+    return "\n".join(lines)
+
+
+class RouteError(RuntimeError):
+    """Вызов некуда отправить — причина уже человеческими словами."""
+
+
+def _route(function: str) -> tuple[McpLink, str]:
+    """Маршрутизация вызова: приставка до «__» — сервер, остальное — инструмент."""
+    key, sep, tool = function.partition(SEP)
+    link = links.get(key)
+    if not sep or link is None:
+        raise RouteError("инструмента {0} нет ни на одном сервере из реестра".format(function))
+    if not link.connected:
+        raise RouteError("сервер {0} не подключён".format(key))
+    return link, tool
+
+
+async def _run_call(call: dict) -> str:
+    """Один вызов из хода модели: отдать нужному серверу и вернуть ответ текстом."""
+    try:
+        link, tool = _route(call["function"])
+        payload, ok = await link.call(tool, call["arguments"])
+        # Ошибку GitHub или PyPI сервер отдаёт словами внутри ответа — для
+        # маршрута это тоже неудавшийся шаг.
+        ok = ok and not (isinstance(payload, dict) and "ошибка" in payload)
+        text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, default=str)
+    except Exception as e:
+        reason = str(e) if isinstance(e, RouteError) else _reason(e)
+        _note(call["server"], "tools/call", "{0} — {1}".format(call["name"], reason),
+              {"инструмент": call["function"], "аргументы": call["arguments"], "ошибка": reason},
+              ok=False)
+        text, ok = "ОШИБКА вызова инструмента: " + reason, False
+    call.update(state="done" if ok else "error", ok=ok)
+    _touch()
+    return text
+
+
 async def ask(text: str) -> dict:
     """Обращение к агенту: модель плюс круги вызовов инструментов через MCP."""
+    global working
     history.append({"role": "user", "text": text})
-    _touch()
 
     tools = _tools_for_model()
-    system = SYSTEM if tools else SYSTEM + NO_TOOLS_NOTE
-    messages: list[dict] = [{"role": "system", "content": system}]
+    messages: list[dict] = [{"role": "system", "content": _system()}]
     messages += [{"role": m["role"], "content": m["text"]} for m in history]
 
+    # Маршрут обращения: каждый вызов — с сервером, инструментом и кругом, на
+    # котором модель его попросила. Интерфейс видит его, пока агент работает.
     calls: list[dict] = []
+    working = {"started": time.time(), "calls": calls, "phase": "model"}
+    _touch()
     tokens = 0
     started = time.perf_counter()
     answer = "Не уложился в отведённые круги работы с инструментами."
 
-    for _ in range(config.TOOL_ROUNDS):
-        response = await asyncio.to_thread(_call_model, messages, tools)
-        if response.usage is not None:
-            tokens += response.usage.total_tokens
-        message = response.choices[0].message
+    try:
+        for round_no in range(config.TOOL_ROUNDS):
+            response = await asyncio.to_thread(_call_model, messages, tools)
+            if response.usage is not None:
+                tokens += response.usage.total_tokens
+            message = response.choices[0].message
 
-        if not message.tool_calls:
-            answer = (message.content or "").strip() or "Модель вернула пустой ответ."
-            break
+            if not message.tool_calls:
+                answer = (message.content or "").strip() or "Модель вернула пустой ответ."
+                break
 
-        messages.append({
-            "role": "assistant",
-            "content": message.content or "",
-            "tool_calls": [
-                {"id": tc.id, "type": "function",
-                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                for tc in message.tool_calls
-            ],
-        })
-        for tc in message.tool_calls:
-            try:
-                arguments = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                arguments = {}
-            try:
-                result = await link.call_tool(tc.function.name, arguments)
-                ok = True
-            except Exception as e:
-                reason = _reason(e)
-                result = "ОШИБКА вызова инструмента: " + reason
-                ok = False
-                link.note("tools/call", "{0} — {1}".format(tc.function.name, reason),
-                          {"инструмент": tc.function.name, "аргументы": arguments, "ошибка": reason},
-                          ok=False)
-            calls.append({"name": tc.function.name, "arguments": arguments, "ok": ok})
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            messages.append({
+                "role": "assistant",
+                "content": message.content or "",
+                "tool_calls": [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in message.tool_calls
+                ],
+            })
+            batch = []
+            for tc in message.tool_calls:
+                try:
+                    arguments = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+                server, sep, tool = tc.function.name.partition(SEP)
+                batch.append({
+                    "round": round_no,
+                    "server": server if sep else "?",
+                    "name": tool if sep else tc.function.name,
+                    "function": tc.function.name,
+                    "arguments": arguments if isinstance(arguments, dict) else {},
+                    "state": "run",
+                    "ok": None,
+                })
+            calls.extend(batch)
+            working["phase"] = "tools"
+            _touch()
+            # Вызовы одного хода друг от друга не зависят — идут параллельно, каждый
+            # на свой сервер. Ответы возвращаются модели в том же порядке.
+            results = await asyncio.gather(*(_run_call(call) for call in batch))
+            for tc, result in zip(message.tool_calls, results):
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            working["phase"] = "model"
+            _touch()
+    finally:
+        working = None
 
     reply = {
         "role": "assistant",
         "text": answer,
-        "calls": calls,
+        "calls": [{key: call[key] for key in ("round", "server", "name", "arguments", "ok")}
+                  for call in calls],
         "tokens": tokens,
         "seconds": round(time.perf_counter() - started, 1),
     }
@@ -368,8 +503,9 @@ class AutoReport:
     async def run_once(self) -> None:
         """Один круг: спросить сводку и, если есть новости, написать её в чат."""
         now = datetime.now().strftime("%H:%M")
+        link = links["github"]   # наблюдение живёт на сервере GitHub
         if not link.connected:
-            self._say("{0} — пропуск: нет соединения с MCP-сервером".format(now))
+            self._say("{0} — пропуск: нет соединения с сервером github".format(now))
             return
         if "watch_summary" not in {t["name"] for t in link.tools}:
             self._say("{0} — пропуск: инструмент watch_summary выключен на сервере".format(now))
@@ -406,7 +542,8 @@ class AutoReport:
             "kind": "report",
             "time": now,
             "text": (response.choices[0].message.content or "").strip() or "Модель вернула пустую сводку.",
-            "calls": [{"name": "watch_summary", "arguments": arguments, "ok": True}],
+            "calls": [{"round": 0, "server": "github", "name": "watch_summary",
+                       "arguments": arguments, "ok": True}],
             "tokens": response.usage.total_tokens if response.usage else 0,
             "seconds": round(time.perf_counter() - started, 1),
         })
@@ -468,8 +605,8 @@ class Pipeline:
         """Запустить цепочку фоном: интерфейс видит, как шаги проходят по очереди."""
         if self.running:
             raise RuntimeError("пайплайн уже выполняется")
-        if not link.connected:
-            raise RuntimeError("нет соединения с MCP-сервером — нажмите «Подключиться»")
+        if not links["github"].connected:
+            raise RuntimeError("нет соединения с сервером github — нажмите «Подключиться»")
         self.query, self.running, self.status, self.file = query, True, "", None
         self.steps = self._fresh()
         _touch()
@@ -496,8 +633,9 @@ class Pipeline:
         """Один шаг — один tools/call. None — шаг не удался и цепочка встала."""
         tool = self.steps[index]["tool"]
         self._set(index, state="run", text="выполняется…", started=time.time())
+        link = links["github"]   # все три шага живут на сервере GitHub
         if not link.connected:
-            self._stop(index, "нет соединения с MCP-сервером")
+            self._stop(index, "нет соединения с сервером github")
             return None
         if tool not in {t["name"] for t in link.tools}:
             self._stop(index, "инструмент {0} выключен на сервере".format(tool))
@@ -588,10 +726,12 @@ class Pipeline:
             "query": self.query,
             "text": "{0}\n\nОтчёт сохранён: {1}".format(summary["сводка"], saved["файл"]),
             "calls": [
-                {"name": "search_code", "arguments": {"query": self.query}, "ok": True},
-                {"name": "summarize", "arguments": {"found": "ответ search_code целиком"}, "ok": True},
-                {"name": "save_to_file", "arguments": {"name": self.query, "content": "поле «отчёт»"},
-                 "ok": True},
+                {"round": 0, "server": "github", "name": "search_code",
+                 "arguments": {"query": self.query}, "ok": True},
+                {"round": 1, "server": "github", "name": "summarize",
+                 "arguments": {"found": "ответ search_code целиком"}, "ok": True},
+                {"round": 2, "server": "github", "name": "save_to_file",
+                 "arguments": {"name": self.query, "content": "поле «отчёт»"}, "ok": True},
             ],
             "tokens": summary["токенов"],
             "seconds": seconds,
@@ -611,5 +751,7 @@ def clear_history() -> None:
 
 
 def snapshot() -> dict:
-    return {"revision": revision, "messages": history, "mcp": link.snapshot(),
-            "model": config.MODEL, "report": report.snapshot(), "pipeline": pipeline.snapshot()}
+    return {"revision": revision, "messages": history,
+            "links": [link.snapshot() for link in links.values()], "log": journal,
+            "working": working, "model": config.MODEL,
+            "report": report.snapshot(), "pipeline": pipeline.snapshot()}
