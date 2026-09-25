@@ -184,7 +184,7 @@ async def tool_summarize(
 async def tool_save_to_file(
     name: Annotated[str, Field(
         min_length=1, max_length=80,
-        description="Имя файла без расширения, например watch_summary. Файл ляжет в "
+        description="Имя файла без расширения, например сводка. Файл ляжет в "
                     "data/reports/<имя>.md; то же имя перезапишет прошлый отчёт.")],
     content: Annotated[str, Field(
         min_length=1, max_length=200_000,

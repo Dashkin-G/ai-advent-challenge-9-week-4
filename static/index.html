@@ -14,6 +14,11 @@
     --text: #101508; --muted: #1b2413; --accent: #17351c; --accent-dark: #0e2713;
     --ok: #17351c; --warn: #4a3306; --bad: #611a15;
     --user: #94a97a; --user-line: #7a8f61; --shadow: 0 1px 3px rgba(25,35,15,.18);
+    /* Шаги пайплайна: идёт — синий, готово — оранжевый, ошибка — розовый. Такие же
+       приглушённые, как вся тема: текст на них 7,7–8,9:1, рамки к панели не ниже 3,6:1. */
+    --run: #92a9c4; --run-line: #2a4a6f;
+    --done: #d4a87d; --done-line: #764419;
+    --fail: #d1aba9;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
@@ -86,20 +91,24 @@
   .stage {
     flex: 1 1 0; min-width: 0; padding: 7px 12px 8px; border-radius: 10px;
     background: var(--field); border: 2px dashed var(--line); line-height: 1.35;
+    transition: background-color .4s ease, border-color .4s ease, opacity .4s ease;
   }
   .stage-head { display: flex; gap: 8px; align-items: baseline; white-space: nowrap; overflow: hidden; }
   .stage-title { font-size: 18px; font-weight: 680; }
   .stage-tool { font: 16px ui-monospace, Consolas, monospace; color: var(--muted); }
   .stage-text { font-size: 18.5px; margin-top: 2px; overflow-wrap: anywhere; }
   .stage-sub { font-size: 16.5px; color: var(--muted); font-variant-numeric: tabular-nums; min-height: 1.35em; }
-  .stage.run { border: 2px solid var(--accent); animation: pulse 1.4s ease-in-out infinite; }
-  .stage.done { border: 2px solid var(--accent); }
-  .stage.error { border: 2px solid var(--bad); }
+  .stage.run { background: var(--run); border: 2px solid var(--run-line); animation: pulse 1.4s ease-in-out infinite; }
+  .stage.done { background: var(--done); border: 2px solid var(--done-line); }
+  .stage.error { background: var(--fail); border: 2px solid var(--bad); }
   .stage.error .stage-text { color: var(--bad); font-weight: 600; }
   .stage.skip { opacity: .55; }
-  @keyframes pulse { 50% { box-shadow: 0 0 0 5px rgba(23,53,28,.28); } }
-  .arrow { flex: none; align-self: center; font-size: 24px; color: var(--muted); opacity: .45; }
-  .arrow.flow, .arrow.ok { color: var(--accent); opacity: 1; }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 5px rgba(42,74,111,.3); } }
+  /* Стрелка красится вслед за шагом, в который ведёт: данные в работе — синяя,
+     дошли и сверены — оранжевая, изменились по дороге — красная. */
+  .arrow { flex: none; align-self: center; font-size: 24px; color: var(--muted); opacity: .45; transition: color .4s ease; }
+  .arrow.flow { color: var(--run-line); opacity: 1; }
+  .arrow.ok { color: var(--done-line); opacity: 1; }
   .arrow.bad { color: var(--bad); opacity: 1; }
 
   .chat { flex: 1; overflow-y: auto; padding: 22px; display: flex; flex-direction: column; gap: 16px; position: relative; }
@@ -277,7 +286,7 @@
           <div class="auto-title">Пайплайн агента</div>
           <div class="auto-sub" id="pipe-status">—</div>
         </div>
-        <input id="pipe-query" placeholder="например, watch_summary" autocomplete="off"
+        <input id="pipe-query" placeholder="например, сводка" autocomplete="off"
                title="Что искать в коде репозитория" />
         <button class="primary" id="pipe-run">Запустить</button>
       </div>
@@ -474,22 +483,29 @@ function renderPipeline(pipe, connected) {
       : pipe.status || 'ответ каждого шага уходит на вход следующему';
   status.title = status.textContent;
 
+  // Карточки и стрелки создаются один раз, дальше меняются только класс и текст:
+  // так цвет шага переходит плавно, а не мигает при каждой перерисовке.
   const box = $('stages');
-  box.innerHTML = '';
+  if (!box.children.length) {
+    pipe.steps.forEach((step, i) => {
+      if (i) box.insertAdjacentHTML('beforeend', '<div class="arrow">➜</div>');
+      box.insertAdjacentHTML('beforeend', '<div class="stage"><div class="stage-head">' +
+        '<span class="stage-title"></span><span class="stage-tool"></span></div>' +
+        '<div class="stage-text"></div><div class="stage-sub"></div></div>');
+    });
+  }
+  const cards = box.querySelectorAll('.stage');
+  const arrows = box.querySelectorAll('.arrow');
   pipe.steps.forEach((step, i) => {
     if (i) {
-      const arrow = document.createElement('div');
+      const arrow = arrows[i - 1];
       arrow.className = 'arrow' + (step.check === true ? ' ok' : step.check === false ? ' bad'
         : step.state === 'run' ? ' flow' : '');
-      arrow.textContent = '➜';
       arrow.title = step.check === true ? 'данные дошли без изменений: отпечатки отправленного и полученного совпали'
         : step.check === false ? 'данные изменились по дороге' : 'ответ предыдущего шага уходит на вход этому';
-      box.appendChild(arrow);
     }
-    const card = document.createElement('div');
+    const card = cards[i];
     card.className = 'stage ' + step.state;
-    card.innerHTML = '<div class="stage-head"><span class="stage-title"></span><span class="stage-tool"></span></div>' +
-      '<div class="stage-text"></div><div class="stage-sub"></div>';
     card.querySelector('.stage-title').textContent = `${STEP_NUMBERS[i]} ${step.title}`;
     card.querySelector('.stage-tool').textContent = step.tool;
     const text = card.querySelector('.stage-text');
@@ -502,8 +518,12 @@ function renderPipeline(pipe, connected) {
       text.replaceChildren('✓ ', a);
     }
     const sub = card.querySelector('.stage-sub');
-    if (step.state === 'run') sub.dataset.started = step.started; else sub.textContent = step.sub;
-    box.appendChild(card);
+    if (step.state === 'run') {
+      sub.dataset.started = step.started;
+    } else {
+      delete sub.dataset.started;
+      sub.textContent = step.sub;
+    }
   });
 }
 

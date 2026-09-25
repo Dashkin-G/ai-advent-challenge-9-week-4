@@ -118,12 +118,22 @@ async def get(endpoint: str, **params: Any) -> Any:
     endpoint: у GitHub есть свой параметр `path` (фильтр коммитов по файлу).
     """
     query = {key: value for key, value in params.items() if value is not None}
-    try:
-        response = await _http().get(endpoint, params=query)
-    except httpx.HTTPError as e:
-        raise GitHubError(
-            "GitHub не ответил ({0}); проверьте сеть или прокси".format(type(e).__name__)
-        ) from e
+    for attempt in (1, 2):
+        try:
+            response = await _http().get(endpoint, params=query)
+            break
+        except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError) as e:
+            # Оборванное соединение (чаще всего его рвёт прокси) повторяем один раз:
+            # новое соединение почти всегда проходит. Тайм-аут не повторяем.
+            if attempt == 2:
+                raise GitHubError(
+                    "GitHub не ответил ({0}); проверьте сеть или прокси".format(type(e).__name__)
+                ) from e
+            await asyncio.sleep(0.3)
+        except httpx.HTTPError as e:
+            raise GitHubError(
+                "GitHub не ответил ({0}); проверьте сеть или прокси".format(type(e).__name__)
+            ) from e
 
     _remember_rate(response)
     if response.status_code == 404:
